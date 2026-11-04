@@ -25,10 +25,10 @@ no npm token is stored anywhere.
    - Environment: `release`
 4. In **Settings → Publishing access**, require two-factor authentication and
    disallow tokens.
-5. Give this repository the **Agent Hooks Protocol Bot** GitHub App, as the SDKs have
-   it: install the App here (**Contents** and **Pull requests**, read and write), and
-   add this repository to the organization's `RELEASE_APP_ID` variable and
-   `RELEASE_APP_PRIVATE_KEY` secret.
+5. The **Agent Hooks Protocol Bot** GitHub App is installed on all of the organization's
+   repositories, and `release.yml` reads its credentials from the organization's
+   `AHP_BOT_APP_ID` and `AHP_BOT_APP_PRIVATE_KEY` secrets. Check that this repository
+   has access to both.
 6. In the GitHub environment **release**, restrict deployments to `main` and add
    required reviewers as appropriate.
 
