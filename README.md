@@ -74,6 +74,80 @@ more: a project's files count only with a saved `/trust` decision, `--approve`,
 own `.pi` resources. Until then the adapter says what it ignored. User files always
 count.
 
+## Sign in to a backend
+
+A backend may need credentials. A `bearer` binding (`"authentication": { "type":
+"bearer", "tokenEnv": "NAME" }`, or `tokenRef` naming a key in `ahp-secrets.json`) and
+an `Authorization` header in `transport.headers` work as before. A backend behind
+OAuth gets a browser sign-in:
+
+- **At the next turn.** A delivery that needs a sign-in fails (the backend's failure
+  policy applies) and never opens a browser. When the next turn starts, the adapter
+  prepares the sign-in in the background and shows `Sign in to <backend>: <link>` in a
+  widget above the editor and a notification: pi's own UI, never the transcript the
+  model reads. Every turn shows the same link until it expires (10 minutes at most);
+  then the next turn shows a fresh one. Backends that are signed in are left alone.
+- **Commands.** `/ahp status` says, per backend, `authorized`, `needs-login` with the
+  link, `client-credentials`, or `failing` with why. `/ahp login [backend]` opens the
+  browser (`$BROWSER`, or the platform's opener; `BROWSER=none` for none) and asks for
+  the address the browser ended on, for when it cannot reach pi; with no backend it
+  signs in each one that needs it. `/ahp logout <backend>` cancels its pending sign-in
+  and forgets its token.
+- **Without a UI** (`-p`, `--mode json`), the adapter writes that a backend needs a
+  sign-in to stderr and relies on client credentials; `pi -p "/ahp login <backend>"`
+  prints the link and waits for it.
+
+pi listens on `http://127.0.0.1:<port>/callback` for as long as a sign-in is pending,
+so a click any time before it expires completes it. The port is fixed per backend, so
+every pi process uses the same redirect; when several run, one listens, and any of them
+can complete the sign-in. One sign-in covers a backend's event and upload endpoints,
+and no other backend's.
+
+Settings go in an `oauth` object on the backend, beside its `authentication`
+(receivers ignore fields they do not know). All are optional:
+
+```json
+{
+  "id": "com.example.policy",
+  "transport": { "type": "http", "url": "https://hooks.example/ahp" },
+  "oauth": {
+    "issuer": "https://auth.example",
+    "registration": true
+  }
+}
+```
+
+| Setting | Meaning |
+| --- | --- |
+| `issuer` | The authorization server trusted for this backend. Without it, a browser sign-in trusts the one issuer the backend advertises, and client credentials need an `authentication` preset. |
+| `flow` | `authorization_code_pkce` (default) or `client_credentials`. |
+| `scopes` | Scopes to request. |
+| `clientId` | A client registered for pi in advance. It always wins. |
+| `clientSecretRef` | For client credentials: a key in `ahp-secrets.json`. |
+| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document you publish, used where the issuer supports them. `redirectUris` must include this backend's redirect. The adapter publishes none of its own: a document lists exact redirects, and pi's are per backend. |
+| `registration` | `true`, or `{ "clientName", "scopes", "initialAccessTokenRef" }`: permission to register a client (RFC 7591) at `issuer`, which it requires. |
+| `redirectPort` | The callback port (1024–65535). Default: one derived from the backend id. |
+| `loginLifetimeMinutes` | How long a sign-in link lasts, up to 10 (the default). |
+| `allowPrivateNetwork` | Allow the authorization server on loopback or private addresses. Default `false`. |
+
+The registration's own `oauth` preset (`issuer`, `resource`, `clientId`, `flow`,
+`scopes`, `clientSecretRef`) works too; the `oauth` object's settings take precedence.
+
+OAuth requests go only to HTTPS endpoints, follow no redirects, and connect only to
+the public addresses they resolved (unless `allowPrivateNetwork`).
+
+### Where credentials live
+
+pi has no credential store, so the adapter keeps two files in pi's agent directory
+(`~/.pi/agent`, or `$PI_CODING_AGENT_DIR`), each written atomically with mode `0600`:
+
+- `ahp-auth.json`: tokens, refresh tokens, pending sign-ins, discovery results and
+  registered client ids, shared by every pi process of the user. Locks are under
+  `ahp-auth.locks/` and `ahp-auth.json.lock`.
+- `ahp-secrets.json`: client secrets, apart from tokens. Add your own as
+  `{ "version": 1, "secrets": { "<ref>": "<secret>" } }` for `clientSecretRef`,
+  `tokenRef` or `initialAccessTokenRef`; secrets of registered clients go here too.
+
 ## What reaches a backend
 
 | AHP event | pi source | Effects applied |
@@ -158,7 +232,7 @@ session and one client per instance, and drains deliveries at `session_shutdown`
 ```sh
 npm run typecheck
 npm test            # unit tests
-npm run test:e2e    # real pi 1.0.0 and 1.5.0, a fake model, a recording backend
+npm run test:e2e    # real pi 1.0.0 and 1.5.0, a fake model, a recording backend, a fake OAuth server
 ```
 
 The end-to-end tests drive pi over its RPC mode with an isolated home, from a packed
