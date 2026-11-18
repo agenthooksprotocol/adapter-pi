@@ -1,6 +1,6 @@
 {
   "name": "@agenthooksprotocol/adapter-pi",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "Agent Hooks Protocol adapter for the pi coding agent, as a pi extension",
   "license": "Apache-2.0",
