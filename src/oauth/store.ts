@@ -5,8 +5,9 @@
 //
 // Locks are directories (mkdir is atomic): one for each file's read-modify-write,
 // and one per key for `coordinate`. Each names its owner (host, pid and a random
-// token). A lock whose owner on this host has died is broken; one from another
-// host, or with no readable owner, only once nobody refreshed it for STALE_MS.
+// token) and is refreshed while held. A lock whose owner on this host has died is
+// broken; one from another host, or with no readable owner, once nobody refreshed
+// it for STALE_MS; any lock once nobody refreshed it for BACKSTOP_MS (a reused pid).
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
@@ -15,6 +16,8 @@ import { dirname, join } from "node:path";
 import type { SecretStore, StoredRecord, TokenStore } from "agenthooksprotocol/oauth";
 
 const STALE_MS = 30_000;
+/** Well above the SDK's 30s commit budget: no holder legitimately goes this long. */
+const BACKSTOP_MS = 10 * 60_000;
 const HEARTBEAT_MS = 5_000;
 
 function sleep(ms: number, signal: AbortSignal): Promise<void> {
@@ -50,44 +53,61 @@ async function owner(path: string): Promise<Owner | undefined> {
   }
 }
 
-async function age(path: string): Promise<number> {
+/** Which lock directory this is: a lock removed and made again is another one. */
+async function identity(path: string): Promise<{ id: string; age: number } | undefined> {
   try {
-    return Date.now() - (await stat(path)).mtimeMs;
+    const info = await stat(path);
+    return { id: `${info.ino}:${info.birthtimeMs}`, age: Date.now() - info.mtimeMs };
   } catch {
-    return 0;
+    return undefined;
   }
 }
 
-/** The lock's owner token when it was left by a process that will never release
- * it, null for an ownerless lock that is old, else undefined. On this host a pid
- * is final: a live owner (stopped, sleeping, its clock stepped) keeps its lock. */
-async function abandoned(path: string): Promise<string | null | undefined> {
-  const found = await owner(path);
-  if (found?.host === hostname() && typeof found.pid === "number") return alive(found.pid) ? undefined : found.token ?? null;
-  // Unwritten, unreadable, or another host's: only a missed heartbeat tells.
-  if ((await age(path)) <= STALE_MS) return undefined;
-  return found ? found.token ?? null : null;
+/** A lock judged abandoned: which directory it was, and the owner token it held. */
+export interface Judgement {
+  id: string;
+  token: string | null;
 }
 
-/** Break the lock only if it is still the one judged abandoned. Breakers take
- * turns under `<path>.break`, so two cannot both judge one lock and then remove
- * the lock that replaced it. */
-async function breakLock(path: string, judged: string | null): Promise<void> {
+/** The lock as judged when its holder will never release it, else undefined.
+ * Its age is the time since its holder's last heartbeat. On this host a live pid
+ * keeps its lock (stopped, sleeping, or its clock stepped) up to BACKSTOP_MS
+ * without one, past which the pid is taken to be another process's. Another
+ * host's lock, or one with no readable owner, lasts STALE_MS without one. */
+export async function abandoned(path: string): Promise<Judgement | undefined> {
+  const before = await identity(path);
+  if (!before) return undefined;
+  const found = await owner(path);
+  const local = found?.host === hostname() && typeof found.pid === "number";
+  const held = local ? alive(found.pid!) && before.age <= BACKSTOP_MS : before.age <= STALE_MS;
+  if (held) return undefined;
+  return { id: before.id, token: found?.token ?? null };
+}
+
+/** Break the lock only if it is still the one judged abandoned: the same
+ * directory, holding the same token, and no fresher. Breakers take turns under
+ * `<path>.break`. True when the lock is gone. */
+export async function breakLock(path: string, judged: Judgement): Promise<boolean> {
   const breaker = `${path}.break`;
   try {
     await mkdir(breaker, { mode: 0o700 });
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     // Held for moments; one left by a crash is cleared once old.
-    if ((await age(breaker)) > STALE_MS) await rm(breaker, { recursive: true, force: true });
-    return;
+    if (((await identity(breaker))?.age ?? 0) > STALE_MS) await rm(breaker, { recursive: true, force: true });
+    return false;
   }
   try {
-    const current = await owner(path);
-    if ((current?.token ?? null) !== judged) return;
+    const now = await identity(path);
+    if (!now || now.id !== judged.id || ((await owner(path))?.token ?? null) !== judged.token) return false;
+    // Not refreshed since it was judged: an ownerless lock its maker is still writing is not.
+    if (judged.token === null && now.age <= STALE_MS) return false;
     const aside = `${path}.stale-${randomUUID()}`;
-    await rename(path, aside).catch(() => {});
+    await rename(path, aside);
     await rm(aside, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
   } finally {
     await rm(breaker, { recursive: true, force: true });
   }
@@ -107,10 +127,7 @@ export async function withLock<T>(path: string, signal: AbortSignal, work: () =>
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
     const judged = await abandoned(path);
-    if (judged !== undefined) {
-      await breakLock(path, judged);
-      continue;
-    }
+    if (judged && (await breakLock(path, judged))) continue;
     await sleep(wait, signal);
   }
   const release = async () => {

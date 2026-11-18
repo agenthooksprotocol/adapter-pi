@@ -4,7 +4,7 @@ import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StoredRecord } from "agenthooksprotocol/oauth";
-import { FileSecrets, FileTokenStore, withLock } from "../../src/oauth/store.ts";
+import { abandoned, breakLock, FileSecrets, FileTokenStore, withLock } from "../../src/oauth/store.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ahp-pi-store-"));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
@@ -88,19 +88,73 @@ test("a dead owner's lock is broken by exactly one of many waiters at a time", a
   }
 }, 30_000);
 
-test("a live owner on this host keeps its lock however old; a waiter honours its signal", async () => {
+test("a live owner on this host keeps its lock past the heartbeat timeout; a waiter honours its signal", async () => {
   const sleeper = Bun.spawn(["sleep", "30"]);
   try {
     const lock = join(root, "locks", "live");
     mkdirSync(lock, { recursive: true });
     writeFileSync(join(lock, "owner"), JSON.stringify({ pid: sleeper.pid, host: hostname(), token: "live" }));
-    const long = new Date(Date.now() - 10 * 60_000);
-    utimesSync(lock, long, long);
+    const stopped = new Date(Date.now() - 5 * 60_000);
+    utimesSync(lock, stopped, stopped);
     await expect(withLock(lock, AbortSignal.timeout(300), async () => "stolen")).rejects.toBeDefined();
     expect(JSON.parse(readFileSync(join(lock, "owner"), "utf8")).token).toBe("live");
   } finally {
     sleeper.kill();
   }
+});
+
+test("a live pid with no heartbeat past the backstop is someone else's: the lock is broken", async () => {
+  const lock = join(root, "locks", "reused");
+  mkdirSync(lock, { recursive: true });
+  // pid 1 always runs: the pid of a holder that died and was reused.
+  writeFileSync(join(lock, "owner"), JSON.stringify({ pid: 1, host: hostname(), token: "gone" }));
+  const long = new Date(Date.now() - 11 * 60_000);
+  utimesSync(lock, long, long);
+  expect(await withLock(lock, AbortSignal.timeout(2_000), async () => "ran")).toBe("ran");
+});
+
+test("a waiter backs off while another breaks the lock, and does not spin", async () => {
+  const lock = join(root, "locks", "breaking");
+  deadLock(lock);
+  mkdirSync(`${lock}.break`);
+  const cpu = process.cpuUsage();
+  const started = Date.now();
+  await expect(withLock(lock, AbortSignal.timeout(1_000), async () => "early")).rejects.toBeDefined();
+  const used = process.cpuUsage(cpu);
+  expect((used.user + used.system) / 1000).toBeLessThan((Date.now() - started) * 0.3);
+  rmSync(`${lock}.break`, { recursive: true });
+  expect(await withLock(lock, signal(), async () => "ran")).toBe("ran");
+});
+
+test("a break removes only the lock it judged: not one with another token, nor a new directory", async () => {
+  const lock = join(root, "locks", "judged");
+  deadLock(lock);
+  const judged = (await abandoned(lock))!;
+  expect(judged.token).toBe("dead");
+  // Replaced by a live holder before the break.
+  writeFileSync(join(lock, "owner"), JSON.stringify({ pid: process.pid, host: hostname(), token: "fresh" }));
+  expect(await breakLock(lock, judged)).toBe(false);
+  expect(existsSync(lock)).toBe(true);
+
+  // An old ownerless lock, removed and made again before its owner file appears.
+  rmSync(lock, { recursive: true });
+  mkdirSync(lock);
+  const long = new Date(Date.now() - 60_000);
+  utimesSync(lock, long, long);
+  const ownerless = (await abandoned(lock))!;
+  expect(ownerless.token).toBeNull();
+  rmSync(lock, { recursive: true });
+  mkdirSync(lock);
+  expect(await breakLock(lock, ownerless)).toBe(false);
+  expect(existsSync(lock)).toBe(true);
+  // Even one as old: it is another directory.
+  utimesSync(lock, long, long);
+  expect(await breakLock(lock, ownerless)).toBe(false);
+  expect(existsSync(lock)).toBe(true);
+  // The judged one itself goes.
+  utimesSync(lock, long, long);
+  expect(await breakLock(lock, (await abandoned(lock))!)).toBe(true);
+  expect(existsSync(lock)).toBe(false);
 });
 
 test("another host's lock, or one with no owner, is broken only once nobody refreshes it", async () => {
