@@ -4,6 +4,7 @@
 //
 //   "oauth": {
 //     "issuer": "https://auth.example.com",   // the one issuer trusted for this backend
+//     "trustAdvertisedIssuer": false,         // or, for a browser sign-in only, the one it advertises
 //     "flow": "authorization_code_pkce",      // or "client_credentials"
 //     "scopes": ["hooks"],
 //     "clientId": "pi",                       // a pre-registered client, or:
@@ -27,6 +28,9 @@ export interface Endpoint {
 
 export interface OAuthSettings {
   issuer?: string;
+  /** Without `issuer`, trust the one issuer the backend advertises, for a public
+   * browser sign-in only: the person sees where they sign in. */
+  trustAdvertisedIssuer: boolean;
   flow?: Flow;
   scopes?: string[];
   clientId?: string;
@@ -90,7 +94,7 @@ export function backendAuth(backend: Record<string, unknown>): { auth: BackendAu
   const headerAuthorization = Object.keys(headers).some((name) => name.toLowerCase() === "authorization");
 
   const raw = backend.oauth;
-  const settings: OAuthSettings = { redirectPort: defaultPort(id), loginLifetimeMs: MAX_LIFETIME_MS, allowPrivateNetwork: false };
+  const settings: OAuthSettings = { trustAdvertisedIssuer: false, redirectPort: defaultPort(id), loginLifetimeMs: MAX_LIFETIME_MS, allowPrivateNetwork: false };
   const ignore = (name: string, why: string) => problems.push(`${id}: oauth.${name} ${why}; ignored`);
   if (raw !== undefined && !object(raw)) problems.push(`${id}: oauth is not an object; ignored`);
   const given = object(raw) ? raw : {};
@@ -142,6 +146,10 @@ export function backendAuth(backend: Record<string, unknown>): { auth: BackendAu
     if (typeof minutes === "number" && minutes > 0 && minutes <= 10) settings.loginLifetimeMs = Math.round(minutes * 60_000);
     else ignore("loginLifetimeMinutes", "is not more than 0 and at most 10");
   }
+  if (given.trustAdvertisedIssuer !== undefined) {
+    if (typeof given.trustAdvertisedIssuer === "boolean") settings.trustAdvertisedIssuer = given.trustAdvertisedIssuer;
+    else ignore("trustAdvertisedIssuer", "is not a boolean");
+  }
   if (given.allowPrivateNetwork !== undefined) {
     if (typeof given.allowPrivateNetwork === "boolean") settings.allowPrivateNetwork = given.allowPrivateNetwork;
     else ignore("allowPrivateNetwork", "is not a boolean");
@@ -158,4 +166,15 @@ export function backendAuth(backend: Record<string, unknown>): { auth: BackendAu
     },
     problems,
   };
+}
+
+/** The issuer a backend may use among those advertised, or undefined. A server's
+ * advertisement never selects a trusted issuer by itself: it needs `issuer` (or a
+ * preset's), or the explicit `trustAdvertisedIssuer` for a public browser sign-in.
+ * A client secret or client credentials always need a configured issuer. */
+export function trustedIssuer(options: { configured: string | undefined; trustAdvertised: boolean; flow: Flow; confidential: boolean; advertised: readonly string[] }): string | undefined {
+  const { configured, trustAdvertised, flow, confidential, advertised } = options;
+  if (configured !== undefined) return advertised.includes(configured) ? configured : undefined;
+  if (!trustAdvertised || flow !== "authorization_code_pkce" || confidential || advertised.length !== 1) return undefined;
+  return advertised[0];
 }

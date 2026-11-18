@@ -23,7 +23,7 @@ import {
 import { join } from "node:path";
 import { receive } from "./callback.js";
 import { networkPolicy } from "./network.js";
-import { backendAuth, type BackendAuth, type Endpoint } from "./settings.js";
+import { backendAuth, trustedIssuer, type BackendAuth, type Endpoint } from "./settings.js";
 import { FileSecrets, FileTokenStore } from "./store.js";
 
 export const NAMESPACE = "dev.pi";
@@ -107,19 +107,22 @@ export class Logins {
     });
   }
 
-  /** Local trust: the issuer, client and scopes this backend may use. An issuer's
-   * advertisement alone is trusted only for a browser login, where the person
-   * sees where they sign in, and only when it is the one advertised. */
+  /** Local trust: the issuer, client and scopes this backend may use. */
   async #select(backend: BackendAuth, issuers: readonly string[], resource: string, binding: Record<string, unknown> | undefined, operation: Operation): Promise<ClientConfig> {
     operation.signal.throwIfAborted();
     const { settings } = backend;
     const preset = binding?.type === "oauth" ? binding : undefined;
     const flow = settings.flow ?? (preset?.flow as ClientConfig["flow"] | undefined) ?? "authorization_code_pkce";
-    const trusted = settings.issuer ?? (preset?.issuer as string | undefined);
-    const issuer = trusted ?? (flow === "authorization_code_pkce" && issuers.length === 1 ? issuers[0] : undefined);
-    if (!issuer || !issuers.includes(issuer)) throw new AuthError("access_denied");
     const clientId = settings.clientId ?? (preset?.clientId as string | undefined);
     const secretRef = settings.clientSecretRef ?? (preset?.clientSecretRef as string | undefined);
+    const issuer = trustedIssuer({
+      configured: settings.issuer ?? (preset?.issuer as string | undefined),
+      trustAdvertised: settings.trustAdvertisedIssuer,
+      flow,
+      confidential: secretRef !== undefined || flow === "client_credentials",
+      advertised: issuers,
+    });
+    if (!issuer) throw new AuthError("access_denied");
     let clientSecret: string | undefined;
     if (secretRef !== undefined) {
       clientSecret = await this.secrets.get(secretRef, operation.signal);
@@ -160,7 +163,8 @@ export class Logins {
 
   /** A turn starts: prepare, in the background, each login a delivery asked for. */
   turnStart(): void {
-    for (const id of this.#needed.keys()) {
+    // And each link shown: another pi may have completed it, or released its port.
+    for (const id of new Set([...this.#needed.keys(), ...this.#pending.keys()])) {
       if (this.#preparing.has(id)) continue;
       if (!this.host.hasUI) {
         // No one to show a link to, and nothing listening once this run ends.
@@ -177,7 +181,7 @@ export class Logins {
     const backend = this.#backends.get(id)!;
     // The stored login this process already shows: nothing to prepare.
     const shown = this.#pending.get(id);
-    if (shown && shown.expiresAt > Date.now() && (await this.#stillPending(backend, shown))) return;
+    if (shown && shown.expiresAt > Date.now() && (await this.#stillPending(backend, shown))) return this.#listen(backend, shown);
     const result = await this.#prepare(backend);
     if (typeof result === "string") this.host.log(`${id}: sign-in not prepared: ${result}`);
   }
@@ -224,10 +228,15 @@ export class Logins {
   async #show(backend: Backend, login: PendingLogin): Promise<void> {
     const previous = this.#pending.get(backend.id);
     this.#pending.set(backend.id, login);
-    await receive(backend.settings.redirectPort, login.expiresAt + 5_000, backend.id, (callback) => this.#callback(backend, callback))
-      .catch((error) => this.host.log(`${backend.id}: no callback listener: ${String(error)}`));
+    await this.#listen(backend, login);
     this.#render();
     if (previous?.authorizationUrl !== login.authorizationUrl) this.host.notify(`Sign in to ${backend.id}: ${login.authorizationUrl}`);
+  }
+
+  /** Receive the login's redirect, or keep trying while another pi holds the port. */
+  async #listen(backend: Backend, login: PendingLogin): Promise<void> {
+    await receive(backend.settings.redirectPort, login.expiresAt + 5_000, backend.id, (callback) => this.#callback(backend, callback))
+      .catch((error) => this.host.log(`${backend.id}: no callback listener: ${String(error)}`));
   }
 
   /** A redirect reached the listener: complete the login it belongs to. */
@@ -397,7 +406,7 @@ export class Logins {
 
 function hint(failure: string): string {
   if (failure === "credential_unavailable") return " (no client: set oauth.clientId, oauth.clientMetadataDocument, or oauth.issuer with oauth.registration in hooks.json)";
-  if (failure === "access_denied") return " (the issuer is not trusted: set oauth.issuer in hooks.json)";
+  if (failure === "access_denied") return " (the issuer is not trusted: set oauth.issuer, or oauth.trustAdvertisedIssuer for a browser sign-in, in hooks.json)";
   if (failure === "untrusted_destination") return " (a private address: set oauth.allowPrivateNetwork in hooks.json)";
   return "";
 }

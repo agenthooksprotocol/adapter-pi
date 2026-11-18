@@ -119,7 +119,8 @@ Settings go in an `oauth` object on the backend, beside its `authentication`
 
 | Setting | Meaning |
 | --- | --- |
-| `issuer` | The authorization server trusted for this backend. Without it, a browser sign-in trusts the one issuer the backend advertises, and client credentials need an `authentication` preset. |
+| `issuer` | The authorization server trusted for this backend (or the `authentication` preset's). A backend's advertisement never chooses one by itself. Client credentials and client secrets always need it. |
+| `trustAdvertisedIssuer` | Without `issuer`, trust the one issuer the backend advertises, for a public browser sign-in only, where you see where you sign in. Default `false`. |
 | `flow` | `authorization_code_pkce` (default) or `client_credentials`. |
 | `scopes` | Scopes to request. |
 | `clientId` | A client registered for pi in advance. It always wins. |

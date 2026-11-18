@@ -18,8 +18,21 @@ interface Receiver {
   handlers: Map<string, CallbackHandler>;
 }
 
-const REGISTRY = Symbol.for("agenthooksprotocol.adapter-pi.callbacks");
-const receivers: Map<number, Receiver> = ((globalThis as Record<symbol, unknown>)[REGISTRY] ??= new Map()) as Map<number, Receiver>;
+/** Logins whose port another process held: retried until they expire, so the
+ * link still works when that process exits. */
+interface Waiting {
+  until: number;
+  handlers: Map<string, CallbackHandler>;
+  timer?: ReturnType<typeof setTimeout>;
+  binding?: Promise<boolean>;
+}
+
+const registry = globalThis as Record<symbol, unknown>;
+const receivers = (registry[Symbol.for("agenthooksprotocol.adapter-pi.callbacks")] ??= new Map()) as Map<number, Receiver>;
+const waiting = (registry[Symbol.for("agenthooksprotocol.adapter-pi.waiting")] ??= new Map()) as Map<number, Waiting>;
+
+/** How often a taken port is tried again. */
+export const RETRY_MS = 2_000;
 
 export const CALLBACK_PATH = "/callback";
 
@@ -38,8 +51,9 @@ function schedule(port: number, receiver: Receiver): void {
   receiver.timer.unref();
 }
 
-/** Listen on `port` until `until` (Unix ms) for `key`'s logins. False when another
- * process holds the port: it receives the callback instead. */
+/** Listen on `port` until `until` (Unix ms) for `key`'s logins. False while
+ * another process holds the port: it receives the callback, and this one keeps
+ * trying to take the port over until the login expires. */
 export async function receive(port: number, until: number, key: string, handler: CallbackHandler): Promise<boolean> {
   const existing = receivers.get(port);
   if (existing) {
@@ -50,7 +64,39 @@ export async function receive(port: number, until: number, key: string, handler:
     }
     return true;
   }
-  const handlers = new Map<string, CallbackHandler>([[key, handler]]);
+  const wait = waiting.get(port) ?? { until, handlers: new Map<string, CallbackHandler>() };
+  wait.handlers.set(key, handler);
+  wait.until = Math.max(wait.until, until);
+  waiting.set(port, wait);
+  return attempt(port);
+}
+
+async function attempt(port: number): Promise<boolean> {
+  const wait = waiting.get(port);
+  if (!wait) return receivers.has(port);
+  wait.binding ??= (async () => {
+    clearTimeout(wait.timer);
+    const server = await bind(port, wait.handlers);
+    if (server) {
+      waiting.delete(port);
+      const receiver: Receiver = { server, until: wait.until, handlers: wait.handlers };
+      receivers.set(port, receiver);
+      schedule(port, receiver);
+      return true;
+    }
+    if (Date.now() + RETRY_MS < wait.until) {
+      wait.timer = setTimeout(() => void attempt(port).catch(() => {}), RETRY_MS);
+      wait.timer.unref();
+    } else waiting.delete(port);
+    return false;
+  })().finally(() => {
+    wait.binding = undefined;
+  });
+  return wait.binding;
+}
+
+/** A listening server, or undefined when the port is taken. */
+async function bind(port: number, handlers: Map<string, CallbackHandler>): Promise<Server | undefined> {
   const server = createServer((request, response) => {
     void (async () => {
       const url = new URL(request.url ?? "/", redirectUri(port));
@@ -72,13 +118,10 @@ export async function receive(port: number, until: number, key: string, handler:
     server.once("error", (error: NodeJS.ErrnoException) => (error.code === "EADDRINUSE" ? resolve(false) : reject(error)));
     server.listen(port, "127.0.0.1", () => resolve(true));
   });
-  if (!listening) return false;
+  if (!listening) return undefined;
   server.on("error", () => {});
   server.unref();
-  const receiver: Receiver = { server, until, handlers };
-  receivers.set(port, receiver);
-  schedule(port, receiver);
-  return true;
+  return server;
 }
 
 export function listening(port: number): boolean {
@@ -86,6 +129,11 @@ export function listening(port: number): boolean {
 }
 
 export function close(port: number): void {
+  const wait = waiting.get(port);
+  if (wait) {
+    clearTimeout(wait.timer);
+    waiting.delete(port);
+  }
   const receiver = receivers.get(port);
   if (!receiver) return;
   receivers.delete(port);
