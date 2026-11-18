@@ -1,36 +1,54 @@
 // Where OAuth requests may go. Metadata, registration and token requests leave
 // through `policyFetch`: HTTPS with Node's certificate validation, no redirects,
-// and a DNS lookup that refuses private, loopback and link-local addresses and
+// and a DNS lookup that refuses every address that is not globally reachable and
 // pins the connection to the addresses it checked, so a rebinding name cannot
 // switch them after the check. A backend may allow its private network.
 import { lookup as dnsLookup, type LookupAddress } from "node:dns";
 import { lookup } from "node:dns/promises";
 import { request } from "node:https";
-import { isIP } from "node:net";
+import { BlockList, isIP } from "node:net";
 import { Readable } from "node:stream";
 import { AuthError } from "agenthooksprotocol/client";
 import type { NetworkPurpose, Operation, PolicyFetch } from "agenthooksprotocol/oauth";
 
-/** A globally routable unicast address. */
+/** Special-purpose IPv4 ranges that are not globally reachable (IANA registry). */
+const privateV4 = new BlockList();
+for (const [network, prefix] of [
+  ["0.0.0.0", 8], ["10.0.0.0", 8], ["100.64.0.0", 10], ["127.0.0.0", 8], ["169.254.0.0", 16], ["172.16.0.0", 12],
+  ["192.0.0.0", 24], ["192.0.2.0", 24], ["192.88.99.0", 24], ["192.168.0.0", 16], ["198.18.0.0", 15],
+  ["198.51.100.0", 24], ["203.0.113.0", 24], ["224.0.0.0", 4], ["240.0.0.0", 4],
+] as const) privateV4.addSubnet(network, prefix, "ipv4");
+
+/** IPv6 is global only inside 2000::/3, and not in these parts of it: IETF
+ * protocol assignments (Teredo, benchmarking, ORCHID), documentation, 6to4. */
+const globalV6 = new BlockList();
+globalV6.addSubnet("2000::", 3, "ipv6");
+const privateV6 = new BlockList();
+for (const [network, prefix] of [["2001::", 23], ["2001:db8::", 32], ["2002::", 16], ["3fff::", 20]] as const) privateV6.addSubnet(network, prefix, "ipv6");
+
+/** An IPv4-mapped address (::ffff:a.b.c.d, in any spelling) as its IPv4 form. */
+function unmapped(address: string): string | undefined {
+  let canonical: string;
+  try {
+    canonical = new URL(`http://[${address}]/`).hostname.slice(1, -1);
+  } catch {
+    return undefined;
+  }
+  const mapped = /^::ffff:([\da-f]{1,4}):([\da-f]{1,4})$/.exec(canonical);
+  if (!mapped) return undefined;
+  const high = Number.parseInt(mapped[1]!, 16), low = Number.parseInt(mapped[2]!, 16);
+  return [high >> 8, high & 255, low >> 8, low & 255].join(".");
+}
+
+/** A globally routable unicast address. Anything that is not an IP is not. */
 export function publicAddress(address: string): boolean {
   const host = address.toLowerCase().replace(/^\[|\]$/g, "");
-  if (host.includes(":")) {
-    const mapped = /^::ffff:(\d+\.\d+\.\d+\.\d+)$/.exec(host);
-    if (mapped) return publicAddress(mapped[1]!);
-    return /^[23][\da-f]{3}:/.test(host) && !/^(?:2001:(?:db8|0):|2002:)/.test(host);
-  }
-  const octets = host.split(".").map(Number);
-  if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return false;
-  const [a = 0, b = 0, c = 0] = octets;
-  return !(
-    a === 0 || a === 10 || a === 127 || a >= 224 ||
-    (a === 100 && b >= 64 && b <= 127) ||
-    (a === 169 && b === 254) ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && (b === 168 || b === 0 || (b === 88 && c === 99))) ||
-    (a === 198 && (b === 18 || b === 19 || (b === 51 && c === 100))) ||
-    (a === 203 && b === 0 && c === 113)
-  );
+  const family = isIP(host);
+  if (family === 4) return !privateV4.check(host, "ipv4");
+  if (family !== 6) return false;
+  const v4 = unmapped(host);
+  if (v4 !== undefined) return publicAddress(v4);
+  return globalV6.check(host, "ipv6") && !privateV6.check(host, "ipv6");
 }
 
 function forbidden(): never {

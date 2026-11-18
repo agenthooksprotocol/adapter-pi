@@ -83,8 +83,18 @@ test("settings: a stable port per backend, and registration only for a named iss
 });
 
 test("only public addresses, unless a backend allows its private network", () => {
-  for (const address of ["8.8.8.8", "2606:4700::1111", "::ffff:1.1.1.1"]) expect(publicAddress(address)).toBe(true);
-  for (const address of ["127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "::1", "fd00::1", "::ffff:127.0.0.1", "100.64.0.1"]) expect(publicAddress(address)).toBe(false);
+  for (const address of ["8.8.8.8", "2606:4700::1111", "::ffff:1.1.1.1", "::ffff:808:808", "[2a00:1450::1]"]) expect(publicAddress(address)).toBe(true);
+  for (const address of [
+    "127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "100.64.0.1", "0.0.0.0", "255.255.255.255", "198.18.0.1",
+    "::1", "::", "fd00::1", "fe80::1", "ff02::1",
+    // IPv4-mapped, in every spelling a URL parser or resolver gives.
+    "::ffff:127.0.0.1", "::ffff:7f00:1", "[::ffff:7f00:1]", "::ffff:a00:1", "0:0:0:0:0:ffff:7f00:1", "::ffff:0:a9fe:a9fe",
+    // NAT64, 6to4, Teredo, documentation, IPv4-compatible.
+    "64:ff9b::7f00:1", "64:ff9b:1::1", "2002:7f00:1::1", "2001:0:4136:e378::1", "2001:db8::1", "2001:0db8::1", "3fff::1", "::127.0.0.1",
+    "localhost", "not an address",
+  ]) expect(publicAddress(address)).toBe(false);
+  // The URL parser's spelling of a mapped loopback literal is refused too.
+  expect(publicAddress(new URL("https://[::ffff:127.0.0.1]/").hostname)).toBe(false);
 });
 
 test("an advertised issuer is trusted only by opt-in, for a public browser sign-in", () => {

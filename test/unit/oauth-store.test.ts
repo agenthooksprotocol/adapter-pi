@@ -1,5 +1,5 @@
 import { afterAll, expect, test } from "bun:test";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -126,42 +126,52 @@ test("a waiter backs off while another breaks the lock, and does not spin", asyn
   expect(await withLock(lock, signal(), async () => "ran")).toBe("ran");
 });
 
-test("a break removes only the lock it judged: not one with another token, nor a new directory", async () => {
+test("a break removes only the lock holding the token it judged", async () => {
   const lock = join(root, "locks", "judged");
   deadLock(lock);
-  const judged = (await abandoned(lock))!;
-  expect(judged.token).toBe("dead");
-  // Replaced by a live holder before the break.
-  writeFileSync(join(lock, "owner"), JSON.stringify({ pid: process.pid, host: hostname(), token: "fresh" }));
-  expect(await breakLock(lock, judged)).toBe(false);
-  expect(existsSync(lock)).toBe(true);
-
-  // An old ownerless lock, removed and made again before its owner file appears.
+  const judged = await abandoned(lock);
+  expect(judged).toBe("dead");
+  // Replaced by another holder, as abandoned as the first, before the break.
   rmSync(lock, { recursive: true });
   mkdirSync(lock);
-  const long = new Date(Date.now() - 60_000);
-  utimesSync(lock, long, long);
-  const ownerless = (await abandoned(lock))!;
-  expect(ownerless.token).toBeNull();
-  rmSync(lock, { recursive: true });
-  mkdirSync(lock);
-  expect(await breakLock(lock, ownerless)).toBe(false);
-  expect(existsSync(lock)).toBe(true);
-  // Even one as old: it is another directory.
-  utimesSync(lock, long, long);
-  expect(await breakLock(lock, ownerless)).toBe(false);
-  expect(existsSync(lock)).toBe(true);
-  // The judged one itself goes.
-  utimesSync(lock, long, long);
+  writeFileSync(join(lock, "owner"), JSON.stringify({ pid: DEAD_PID, host: hostname(), token: "next" }));
+  expect(await breakLock(lock, judged!)).toBe(false);
+  expect(JSON.parse(readFileSync(join(lock, "owner"), "utf8")).token).toBe("next");
   expect(await breakLock(lock, (await abandoned(lock))!)).toBe(true);
   expect(existsSync(lock)).toBe(false);
 });
 
-test("another host's lock, or one with no owner, is broken only once nobody refreshes it", async () => {
+test("a lock is never seen without its owner: every holder's token is in place before its work", async () => {
+  const lock = join(root, "locks", "whole");
+  let ownerless = 0;
+  let watching = true;
+  const watch = (async () => {
+    while (watching) {
+      // One listing of whatever directory is the lock at that moment.
+      let names: string[] | undefined;
+      try {
+        names = readdirSync(lock);
+      } catch {}
+      if (names && !names.includes("owner")) ownerless++;
+      await Bun.sleep(0);
+    }
+  })();
+  await Promise.all(Array.from({ length: 10 }, (_, index) => withLock(lock, signal(), async () => {
+    expect(JSON.parse(readFileSync(join(lock, "owner"), "utf8")).pid).toBe(process.pid);
+    await Bun.sleep(index % 3);
+  })));
+  watching = false;
+  await watch;
+  expect(ownerless).toBe(0);
+  // No prepared directory is left behind.
+  expect(readdirSync(join(root, "locks")).filter((name) => name.startsWith("whole."))).toEqual([]);
+});
+
+test("another host's lock is broken only once nobody refreshes it", async () => {
   const lock = join(root, "locks", "remote");
   deadLock(lock, "elsewhere");
   await expect(withLock(lock, AbortSignal.timeout(200), async () => "early")).rejects.toBeDefined();
-  const long = new Date(Date.now() - 10 * 60_000);
+  const long = new Date(Date.now() - 60_000);
   utimesSync(lock, long, long);
   expect(await withLock(lock, signal(), async () => "ran")).toBe("ran");
 });
