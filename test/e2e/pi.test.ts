@@ -159,6 +159,45 @@ class World {
     void this.#read();
   }
 
+  /** Another pi of the same user, beside this one: same home, store and hooks. */
+  another(env: Record<string, string> = {}) {
+    const child = Bun.spawn(["node", this.cli, "-e", installed, "--provider", "fake", "--model", "m", "--mode", "rpc"], {
+      cwd: this.project,
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: Bun.file(join(this.dir, "pi-other.err")),
+      env: { PATH: process.env.PATH!, HOME: this.home, PI_CODING_AGENT_DIR: this.agent, PI_OFFLINE: "1", AHP_HOOKS_FILE: join(this.dir, "hooks.json"), ...env },
+    });
+    const ui: Record<string, any>[] = [];
+    void (async () => {
+      let buffer = "";
+      for await (const chunk of child.stdout as unknown as AsyncIterable<Uint8Array>) {
+        buffer += new TextDecoder().decode(chunk);
+        let end: number;
+        while ((end = buffer.indexOf("\n")) >= 0) {
+          const line = buffer.slice(0, end);
+          buffer = buffer.slice(end + 1);
+          try {
+            const wire = JSON.parse(line);
+            if (wire.type === "extension_ui_request") ui.push(wire);
+          } catch {}
+        }
+      }
+    })();
+    const stdin = child.stdin as unknown as { write(text: string): void; flush(): void; end(): void };
+    return {
+      ui,
+      send(command: Record<string, unknown>) {
+        stdin.write(`${JSON.stringify(command)}\n`);
+        stdin.flush();
+      },
+      async stop() {
+        stdin.end();
+        await Promise.race([child.exited, Bun.sleep(8000).then(() => child.kill())]);
+      },
+    };
+  }
+
   async #read(): Promise<void> {
     const decoder = new TextDecoder();
     let buffer = "";
@@ -1178,6 +1217,41 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       await world.until(() => world.uiOf("notify", status).some((request) => String(request.message).includes("org.example.second: needs-login")), "the status");
       expect(world.uiOf("notify", status).find((request) => String(request.message).includes("org.example.second: needs-login"))?.message).toContain("org.example.first: authorized");
       expect(backend.registrations).toHaveLength(1);
+    } finally {
+      await backend.stop();
+    }
+  }));
+  test("OAuth: a sign-in another pi completes clears this one's link at its next turn", () => inWorld(async (world) => {
+    const backend = await protectedBackend();
+    const env = { NODE_EXTRA_CA_CERTS: (await tls()).file, BROWSER: "none" };
+    try {
+      world.add(backend.backend(await freePort()));
+      world.start(env);
+      await world.until(() => world.received.length > 0, "pi to start");
+      // A link shown on request, not after a failed delivery.
+      const marker = world.ui.length;
+      world.send({ type: "prompt", message: "/ahp status" });
+      await world.until(() => world.uiOf("notify", marker).some((request) => String(request.message).includes("org.example.protected: needs-login")), "the status");
+      const widget = () => world.uiOf("setWidget", marker).filter((request) => request.widgetKey === "agent-hooks-protocol-login");
+      expect(widget().at(-1)?.widgetLines?.[0]).toStartWith("Sign in to org.example.protected: ");
+
+      // The other pi reuses the same stored login, and completes it.
+      const other = world.another(env);
+      try {
+        other.send({ type: "prompt", message: "/ahp login org.example.protected" });
+        await world.until(() => other.ui.some((request) => request.method === "input"), "the other pi's paste box");
+        const link = other.ui.filter((request) => request.method === "setWidget").at(-1)!.widgetLines[0].replace("Sign in to org.example.protected: ", "");
+        expect(`Sign in to org.example.protected: ${link}`).toBe(widget().at(-1)!.widgetLines[0]);
+        other.send({ type: "extension_ui_response", id: other.ui.find((request) => request.method === "input")!.id, value: await backend.consent(link) });
+        await world.until(() => other.ui.some((request) => request.method === "notify" && request.message === "Signed in to org.example.protected."), "the other pi's sign-in");
+      } finally {
+        await other.stop();
+      }
+
+      const turn = world.ui.length;
+      await world.say("after the other signed in");
+      await world.until(() => world.uiOf("setWidget", turn).some((request) => request.widgetKey === "agent-hooks-protocol-login" && !("widgetLines" in request)), "the link to clear");
+      expect(backend.received.find((entry) => entry.type === "turn.start")?.authorization).toStartWith("Bearer ");
     } finally {
       await backend.stop();
     }
