@@ -1,5 +1,6 @@
 import { afterAll, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from "node:fs";
+import { hostname } from "node:os";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { StoredRecord } from "agenthooksprotocol/oauth";
@@ -64,21 +65,60 @@ test("coordinate serializes work across processes, and every increment lands", a
   lines.forEach((line, index) => expect(line).toBe(index % 2 === 0 ? "enter" : "leave"));
 }, 30_000);
 
-test("a lock its dead owner left behind is broken; a waiter honours its signal", async () => {
-  const lock = join(root, "locks", "held");
-  mkdirSync(lock, { recursive: true });
-  writeFileSync(join(lock, "owner"), JSON.stringify({ pid: 2 ** 22 + 12345, host: (await import("node:os")).hostname() }));
-  expect(await withLock(lock, signal(), async () => "ran")).toBe("ran");
+const DEAD_PID = 2 ** 22 + 12345;
 
-  let release!: () => void;
-  const held = withLock(lock, signal(), () => new Promise<void>((resolve) => (release = resolve)));
-  await Bun.sleep(20);
-  const controller = new AbortController();
-  const waiting = withLock(lock, controller.signal, async () => "never");
-  controller.abort(new Error("gave up"));
-  await expect(waiting).rejects.toThrow("gave up");
-  release();
-  await held;
+function deadLock(lock: string, host = hostname()) {
+  mkdirSync(lock, { recursive: true });
+  writeFileSync(join(lock, "owner"), JSON.stringify({ pid: DEAD_PID, host, token: "dead" }));
+}
+
+test("a dead owner's lock is broken by exactly one of many waiters at a time", async () => {
+  for (let round = 0; round < 20; round++) {
+    const lock = join(root, "contended", String(round));
+    deadLock(lock);
+    let holders = 0;
+    let most = 0;
+    await Promise.all(Array.from({ length: 12 }, () => withLock(lock, signal(), async () => {
+      most = Math.max(most, ++holders);
+      await Bun.sleep(1);
+      holders--;
+    })));
+    expect(most).toBe(1);
+    expect(existsSync(lock)).toBe(false);
+  }
+}, 30_000);
+
+test("a live owner on this host keeps its lock however old; a waiter honours its signal", async () => {
+  const sleeper = Bun.spawn(["sleep", "30"]);
+  try {
+    const lock = join(root, "locks", "live");
+    mkdirSync(lock, { recursive: true });
+    writeFileSync(join(lock, "owner"), JSON.stringify({ pid: sleeper.pid, host: hostname(), token: "live" }));
+    const long = new Date(Date.now() - 10 * 60_000);
+    utimesSync(lock, long, long);
+    await expect(withLock(lock, AbortSignal.timeout(300), async () => "stolen")).rejects.toBeDefined();
+    expect(JSON.parse(readFileSync(join(lock, "owner"), "utf8")).token).toBe("live");
+  } finally {
+    sleeper.kill();
+  }
+});
+
+test("another host's lock, or one with no owner, is broken only once nobody refreshes it", async () => {
+  const lock = join(root, "locks", "remote");
+  deadLock(lock, "elsewhere");
+  await expect(withLock(lock, AbortSignal.timeout(200), async () => "early")).rejects.toBeDefined();
+  const long = new Date(Date.now() - 10 * 60_000);
+  utimesSync(lock, long, long);
+  expect(await withLock(lock, signal(), async () => "ran")).toBe("ran");
+});
+
+test("release removes only the holder's own lock", async () => {
+  const lock = join(root, "locks", "replaced");
+  await withLock(lock, signal(), async () => {
+    // Someone judged it abandoned and took it over.
+    writeFileSync(join(lock, "owner"), JSON.stringify({ pid: process.pid, host: hostname(), token: "theirs" }));
+  });
+  expect(JSON.parse(readFileSync(join(lock, "owner"), "utf8")).token).toBe("theirs");
 });
 
 test("secrets live in their own 0600 file, by reference", async () => {

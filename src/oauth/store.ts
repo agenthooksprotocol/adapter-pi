@@ -4,8 +4,9 @@
 // run, so a token refreshed in one must be the token the others read.
 //
 // Locks are directories (mkdir is atomic): one for each file's read-modify-write,
-// and one per key for `coordinate`. A holder refreshes its lock while it works; a
-// lock whose owner died, or that nobody refreshed for STALE_MS, is broken.
+// and one per key for `coordinate`. Each names its owner (host, pid and a random
+// token). A lock whose owner on this host has died is broken; one from another
+// host, or with no readable owner, only once nobody refreshed it for STALE_MS.
 import { createHash, randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from "node:fs/promises";
@@ -39,18 +40,56 @@ function alive(pid: number): boolean {
   }
 }
 
-/** Whether the lock at `path` was left by a process that will never release it. */
-async function stale(path: string): Promise<boolean> {
+type Owner = { pid?: number; host?: string; token?: string };
+
+async function owner(path: string): Promise<Owner | undefined> {
   try {
-    const owner = JSON.parse(await readFile(join(path, "owner"), "utf8")) as { pid?: number; host?: string };
-    if (owner.host === hostname() && typeof owner.pid === "number" && !alive(owner.pid)) return true;
+    return JSON.parse(await readFile(join(path, "owner"), "utf8")) as Owner;
   } catch {
-    // Not written yet, or already gone: only its age can tell.
+    return undefined;
+  }
+}
+
+async function age(path: string): Promise<number> {
+  try {
+    return Date.now() - (await stat(path)).mtimeMs;
+  } catch {
+    return 0;
+  }
+}
+
+/** The lock's owner token when it was left by a process that will never release
+ * it, null for an ownerless lock that is old, else undefined. On this host a pid
+ * is final: a live owner (stopped, sleeping, its clock stepped) keeps its lock. */
+async function abandoned(path: string): Promise<string | null | undefined> {
+  const found = await owner(path);
+  if (found?.host === hostname() && typeof found.pid === "number") return alive(found.pid) ? undefined : found.token ?? null;
+  // Unwritten, unreadable, or another host's: only a missed heartbeat tells.
+  if ((await age(path)) <= STALE_MS) return undefined;
+  return found ? found.token ?? null : null;
+}
+
+/** Break the lock only if it is still the one judged abandoned. Breakers take
+ * turns under `<path>.break`, so two cannot both judge one lock and then remove
+ * the lock that replaced it. */
+async function breakLock(path: string, judged: string | null): Promise<void> {
+  const breaker = `${path}.break`;
+  try {
+    await mkdir(breaker, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+    // Held for moments; one left by a crash is cleared once old.
+    if ((await age(breaker)) > STALE_MS) await rm(breaker, { recursive: true, force: true });
+    return;
   }
   try {
-    return Date.now() - (await stat(path)).mtimeMs > STALE_MS;
-  } catch {
-    return false;
+    const current = await owner(path);
+    if ((current?.token ?? null) !== judged) return;
+    const aside = `${path}.stale-${randomUUID()}`;
+    await rename(path, aside).catch(() => {});
+    await rm(aside, { recursive: true, force: true });
+  } finally {
+    await rm(breaker, { recursive: true, force: true });
   }
 }
 
@@ -58,6 +97,7 @@ async function stale(path: string): Promise<boolean> {
  * work after `signal` aborts; holds the lock until work settles. */
 export async function withLock<T>(path: string, signal: AbortSignal, work: () => Promise<T>): Promise<T> {
   await mkdir(dirname(path), { recursive: true, mode: 0o700 });
+  const token = randomUUID();
   for (let wait = 5; ; wait = Math.min(wait * 2, 100)) {
     signal.throwIfAborted();
     try {
@@ -66,17 +106,25 @@ export async function withLock<T>(path: string, signal: AbortSignal, work: () =>
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
     }
-    if (await stale(path)) {
-      // Moved aside first: two breakers cannot both remove a fresh lock.
-      const aside = `${path}.stale-${randomUUID()}`;
-      await rename(path, aside).then(() => rm(aside, { recursive: true, force: true }), () => {});
+    const judged = await abandoned(path);
+    if (judged !== undefined) {
+      await breakLock(path, judged);
       continue;
     }
     await sleep(wait, signal);
   }
+  const release = async () => {
+    // Only our own: a lock judged abandoned and replaced is someone else's now.
+    if ((await owner(path))?.token !== token) return;
+    const aside = `${path}.released-${randomUUID()}`;
+    await rename(path, aside).then(() => rm(aside, { recursive: true, force: true }), () => {});
+  };
   try {
     signal.throwIfAborted();
-    await writeFile(join(path, "owner"), JSON.stringify({ pid: process.pid, host: hostname() }), { mode: 0o600 });
+    // Written whole, by rename: a reader never sees half an owner.
+    const temporary = join(path, `owner.${token}`);
+    await writeFile(temporary, JSON.stringify({ pid: process.pid, host: hostname(), token }), { mode: 0o600 });
+    await rename(temporary, join(path, "owner"));
   } catch (error) {
     await rm(path, { recursive: true, force: true });
     throw error;
@@ -90,7 +138,7 @@ export async function withLock<T>(path: string, signal: AbortSignal, work: () =>
     return await work();
   } finally {
     clearInterval(heartbeat);
-    await rm(path, { recursive: true, force: true });
+    await release();
   }
 }
 
