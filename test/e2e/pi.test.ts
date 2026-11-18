@@ -248,6 +248,7 @@ async function protectedBackend() {
   const issued = new Set<string>();
   const codes = new Map<string, { client: string; challenge: string; redirect: string; resource: string | null }>();
   const received: { type: string; authorization: string | null }[] = [];
+  const metadata: string[] = [];
   const registrations: Record<string, unknown>[] = [];
   const authorizations: string[] = [];
   const server = Bun.serve({
@@ -257,6 +258,7 @@ async function protectedBackend() {
     fetch: async (request) => {
       const url = new URL(request.url);
       const origin = url.origin;
+      if (url.pathname.startsWith("/.well-known/")) metadata.push(url.pathname);
       if (url.pathname === "/.well-known/oauth-protected-resource/ahp") {
         return Response.json({ resource: `${origin}/ahp`, authorization_servers: [origin] });
       }
@@ -322,14 +324,15 @@ async function protectedBackend() {
     received,
     registrations,
     authorizations,
+    metadata,
     /** What a browser does with the link: follow it to its redirect, without visiting it. */
     async consent(link: string): Promise<string> {
       const response = await fetch(link, { redirect: "manual", tls: { ca: cert } } as RequestInit);
       return response.headers.get("location")!;
     },
-    backend(redirectPort: number) {
+    backend(redirectPort: number, id = "org.example.protected") {
       return {
-        id: "org.example.protected",
+        id,
         transport: { type: "http", url: `${origin}/ahp` },
         oauth: { issuer: origin, registration: true, allowPrivateNetwork: true, redirectPort },
         subscriptions: [
@@ -1088,7 +1091,10 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       expect(landed.status).toBe(200);
       expect(await landed.text()).toContain("Signed in to org.example.protected");
       await world.until(() => world.uiOf("notify", marker).some((request) => request.message === "Signed in to org.example.protected."), "the sign-in notice");
-      expect(world.uiOf("setWidget", marker).at(-1)?.widgetLines).toBeUndefined();
+      const widget = () => world.uiOf("setWidget", marker).filter((request) => request.widgetKey === "agent-hooks-protocol-login");
+      await world.until(() => widget().length > 0, "the hint to clear");
+      expect(widget().at(-1)).toMatchObject({ widgetKey: "agent-hooks-protocol-login" });
+      expect(widget().at(-1)).not.toHaveProperty("widgetLines");
 
       await world.say("signed in");
       await world.until(() => backend.received.some((entry) => entry.type === "turn.start"), "an authorized delivery");
@@ -1098,6 +1104,18 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       const store = join(world.agent, "ahp-auth.json");
       expect(statSync(store).mode & 0o777).toBe(0o600);
       expect(readFileSync(store, "utf8")).toContain(token!);
+
+      // Signed in: later turns show no link and prepare nothing.
+      const quiet = world.ui.length;
+      const lookups = backend.metadata.length;
+      await world.say("still signed in");
+      await world.say("and still");
+      await Bun.sleep(300);
+      expect(world.uiOf("setWidget", quiet)).toEqual([]);
+      expect(world.uiOf("notify", quiet).filter((request) => String(request.message).includes("Sign in"))).toEqual([]);
+      expect(backend.metadata.length).toBe(lookups);
+      expect(readFileSync(store, "utf8")).not.toContain("pending_login");
+      expect(backend.received.filter((entry) => entry.type === "turn.start").every((entry) => entry.authorization === `Bearer ${token}`)).toBe(true);
     } finally {
       await backend.stop();
     }
@@ -1131,6 +1149,35 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       const before = backend.received.length;
       await world.say("signed out");
       expect(backend.received.slice(before).filter((entry) => entry.type === "turn.start")).toEqual([]);
+    } finally {
+      await backend.stop();
+    }
+  }));
+  test("OAuth: a sign-in belongs to one backend: another on the same server still needs its own", () => inWorld(async (world) => {
+    const backend = await protectedBackend();
+    try {
+      // One port, so one registered client: only the grant partition tells them apart.
+      const port = await freePort();
+      world.add(backend.backend(port, "org.example.first"));
+      world.add(backend.backend(port, "org.example.second"));
+      world.start({ NODE_EXTRA_CA_CERTS: certificate!.file, BROWSER: "none" });
+      await world.until(() => world.received.length > 0, "pi to start");
+      const marker = world.ui.length;
+      world.send({ type: "prompt", message: "/ahp login org.example.first" });
+      await world.until(() => world.uiOf("input", marker).length > 0, "the paste box");
+      const link = world.uiOf("setWidget", marker).at(-1)!.widgetLines[0].replace("Sign in to org.example.first: ", "");
+      world.send({ type: "extension_ui_response", id: world.uiOf("input", marker)[0]!.id, value: await backend.consent(link) });
+      await world.until(() => world.uiOf("notify", marker).some((request) => request.message === "Signed in to org.example.first."), "the sign-in");
+
+      await world.say("one of two");
+      await world.until(() => backend.received.some((entry) => entry.type === "turn.end"), "the first backend's delivery");
+      // One authorized delivery per event: the first's. The second sent nothing.
+      expect(backend.received.filter((entry) => entry.type === "turn.start")).toHaveLength(1);
+      const status = world.ui.length;
+      world.send({ type: "prompt", message: "/ahp status" });
+      await world.until(() => world.uiOf("notify", status).some((request) => String(request.message).includes("org.example.second: needs-login")), "the status");
+      expect(world.uiOf("notify", status).find((request) => String(request.message).includes("org.example.second: needs-login"))?.message).toContain("org.example.first: authorized");
+      expect(backend.registrations).toHaveLength(1);
     } finally {
       await backend.stop();
     }
