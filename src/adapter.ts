@@ -7,13 +7,25 @@
 import { VERSION, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Hooks } from "agenthooksprotocol/client";
 import { capabilities, gaps, gapsWithoutUI, MAX_CONTINUATIONS, withoutUI } from "./capabilities.js";
-import { loadMcpServers, loadRegistration, projectDecided } from "./config.js";
+import { agentDir, loadMcpServers, loadRegistration, projectDecided } from "./config.js";
+import { Logins, type LoginHost } from "./oauth/index.js";
 import { describe, messages, type AnyResult } from "./effects.js";
 
 export const SOURCE = "urn:pi:coding-agent";
 export const EXTENSION = "dev.pi";
 /** The custom message type this adapter's context travels under. */
 export const CUSTOM_TYPE = "agent-hooks-protocol";
+
+const LOGIN_WIDGET = "agent-hooks-protocol-login";
+
+/** The command that opens a link: $BROWSER (empty or "none" for none), or the platform's. */
+function browser(): string[] {
+  const chosen = process.env.BROWSER;
+  if (chosen !== undefined) return chosen === "none" ? [] : chosen.split(" ").filter(Boolean);
+  if (process.platform === "darwin") return ["open"];
+  if (process.platform === "win32") return ["rundll32", "url.dll,FileProtocolHandler"];
+  return ["xdg-open"];
+}
 
 const contentCategories = ["text", "reasoning", "instructions", "attachment", "summary", "system", "tool_call", "tool_result"];
 
@@ -78,6 +90,8 @@ export class Adapter {
   /** How each call of the current model request resolved, for its batch. */
   resolved = new Map<string, { outcome: "ok" | "error" | "denied" | "cancelled"; execution: { status: "executed" } | { status: "skipped"; reason: "policy" | "cancelled" | "supplied_result" | "other"; detail?: string } }>();
   mcp = new Map<string, Record<string, unknown>>();
+  /** OAuth for the registration's backends; undefined without a registration. */
+  logins: Logins | undefined;
   #queue: Promise<unknown> = Promise.resolve();
 
   constructor(readonly pi: ExtensionAPI) {}
@@ -104,8 +118,18 @@ export class Adapter {
       for (const line of notes) this.log(line);
       if (untrusted.length) this.warn(`Agent Hooks Protocol ignored ${untrusted.join(", ")}: trust this project with /trust or --approve to use it.`);
       if (!registration) return;
+      const dir = agentDir(process.env);
+      if (dir) {
+        this.logins = new Logins(this.#loginHost(), dir, registration.hooks);
+        for (const line of this.logins.problems) this.warn(`Agent Hooks Protocol: ${line}`);
+      }
       const hooks = await this.#client(registration);
-      for (const issue of hooks.initializationDiagnostics ?? []) this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}`);
+      for (const issue of hooks.initializationDiagnostics ?? []) {
+        this.logins?.observe(issue.backendId, issue.auth);
+        // A login is shown at the next turn, not here: startup never waits on a person.
+        if (issue.auth?.recovery === "login") this.log(`${issue.backendId}: ${issue.code}: needs a sign-in`);
+        else this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}${issue.auth ? ` (${issue.auth.code})` : ""}`);
+      }
       this.hooks = hooks;
       this.log(`delivering to ${registration.hooks.length} backend(s) from ${sources.map((source) => source.path).join(", ")}`);
     } catch (error) {
@@ -122,6 +146,7 @@ export class Adapter {
         source: SOURCE,
         harness: { name: "pi", version: VERSION },
         capabilities: this.ctx.hasUI ? capabilities : withoutUI,
+        ...(this.logins ? { auth: this.logins.provider } : {}),
         manifestMetadata: {
           authentication: ["bearer", "oauth"],
           contentCategories,
@@ -196,7 +221,8 @@ export class Adapter {
     // The adapter reads no attachment back: release what the SDK kept.
     void result.content?.close().catch(() => {});
     for (const diagnostic of result.diagnostics) {
-      const line = `${diagnostic.backendId} ${diagnostic.phase}: ${diagnostic.code}`;
+      this.logins?.observe(diagnostic.backendId, diagnostic.auth);
+      const line = `${diagnostic.backendId} ${diagnostic.phase}: ${diagnostic.code}${diagnostic.auth ? ` (${diagnostic.auth.code})` : ""}`;
       if (diagnostic.syntheticDenial) this.warn(`${line} (denied by failure policy)`);
       else this.log(line);
     }
@@ -205,8 +231,33 @@ export class Adapter {
 
   /** Show a person something: a notification, or stderr where pi has no UI. */
   notify(text: string, level: "info" | "warning" | "error" = "info"): void {
-    if (this.ctx?.hasUI) this.ctx.ui.notify(text, level);
-    else console.error(text);
+    try {
+      if (this.ctx?.hasUI) return this.ctx.ui.notify(text, level);
+    } catch {
+      // A context of a session pi has replaced.
+    }
+    console.error(text);
+  }
+
+  /** Where a sign-in link may appear: pi's own UI, never the transcript. */
+  #loginHost(): LoginHost {
+    const adapter = this;
+    return {
+      get hasUI() {
+        return adapter.ctx?.hasUI ?? false;
+      },
+      notify: (text, level) => adapter.notify(text, level),
+      widget: (lines) => {
+        if (adapter.ctx?.hasUI) adapter.ctx.ui.setWidget(LOGIN_WIDGET, lines);
+      },
+      input: (title, placeholder, signal) => (adapter.ctx?.hasUI ? adapter.ctx.ui.input(title, placeholder, { signal }) : Promise.resolve(undefined)),
+      open: (url) => {
+        if (!adapter.ctx?.hasUI) return;
+        const [command, ...args] = browser();
+        if (command) adapter.pi.exec(command, [...args, url]).catch(() => {});
+      },
+      log: (text) => adapter.log(text),
+    };
   }
 
   warn(text: string): void {
