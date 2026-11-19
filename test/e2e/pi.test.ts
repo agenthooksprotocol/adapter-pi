@@ -369,11 +369,11 @@ async function protectedBackend() {
       const response = await fetch(link, { redirect: "manual", tls: { ca: cert } } as RequestInit);
       return response.headers.get("location")!;
     },
-    backend(redirectPort: number, id = "org.example.protected") {
+    backend(id = "org.example.protected") {
       return {
         id,
         transport: { type: "http", url: `${origin}/ahp` },
-        oauth: { issuer: origin, registration: true, allowPrivateNetwork: true, redirectPort },
+        oauth: { issuer: origin, registration: true, allowPrivateNetwork: true },
         subscriptions: [
           { mode: "intercept", events: ["turn.start"], timeoutMs: 10000, failurePolicy: "fail-open", content: { default: "body" } },
           { mode: "observe", events: ["turn.end"], content: { default: "body" } },
@@ -382,13 +382,6 @@ async function protectedBackend() {
     },
     stop: () => server.stop(true),
   };
-}
-
-async function freePort(): Promise<number> {
-  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response() });
-  const port = server.port!;
-  await server.stop(true);
-  return port;
 }
 
 const advertised = (manifest: Event, event: string) => manifest.events.find((entry: Event) => entry.event === event);
@@ -1103,8 +1096,7 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
   test("OAuth: a turn shows the sign-in a delivery needed, the same link each turn, and the next delivery carries the token", () => inWorld(async (world) => {
     const backend = await protectedBackend();
     try {
-      const port = await freePort();
-      world.add(backend.backend(port));
+      world.add(backend.backend());
       world.start({ NODE_EXTRA_CA_CERTS: certificate!.file, BROWSER: "none" });
       // The first turn's delivery is refused: no token yet, and no login made for it.
       await world.say("hello");
@@ -1114,7 +1106,9 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       await world.until(() => hint().length > 0, "the sign-in hint");
       const link = hint()[0]!.slice("Sign in to org.example.protected: ".length);
       expect(new URL(link).origin).toBe(backend.origin);
-      expect(new URL(link).searchParams.get("redirect_uri")).toBe(`http://127.0.0.1:${port}/callback`);
+      // A port of this sign-in's own.
+      const redirect = new URL(link).searchParams.get("redirect_uri")!;
+      expect(redirect).toMatch(/^http:\/\/127\.0\.0\.1:\d+\/callback$/);
       // Never in the transcript the model reads.
       expect(world.requests.flatMap((request) => request.messages.map((entry) => text(entry.content))).join("\n")).not.toContain(link);
       // Another turn: the same link, not another login or registration.
@@ -1122,7 +1116,7 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       await Bun.sleep(300);
       expect(new Set(hint())).toEqual(new Set([`Sign in to org.example.protected: ${link}`]));
       expect(backend.registrations).toHaveLength(1);
-      expect(backend.registrations[0]).toMatchObject({ redirect_uris: [`http://127.0.0.1:${port}/callback`], software_id: "@agenthooksprotocol/adapter-pi" });
+      expect(backend.registrations[0]).toMatchObject({ redirect_uris: [redirect], application_type: "native", software_id: "@agenthooksprotocol/adapter-pi" });
 
       // The person follows it; the browser lands on pi's listener.
       const marker = world.ui.length;
@@ -1163,7 +1157,7 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
   test("OAuth: /ahp login takes a pasted redirect, /ahp status reports it, /ahp logout forgets it", () => inWorld(async (world) => {
     const backend = await protectedBackend();
     try {
-      world.add(backend.backend(await freePort()));
+      world.add(backend.backend());
       world.start({ NODE_EXTRA_CA_CERTS: certificate!.file, BROWSER: "none" });
       await world.until(() => world.responses.length > 0 || world.ui.length > 0 || world.received.length > 0, "pi to start");
       const marker = world.ui.length;
@@ -1195,10 +1189,9 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
   test("OAuth: a sign-in belongs to one backend: another on the same server still needs its own", () => inWorld(async (world) => {
     const backend = await protectedBackend();
     try {
-      // One port, so one registered client: only the grant partition tells them apart.
-      const port = await freePort();
-      world.add(backend.backend(port, "org.example.first"));
-      world.add(backend.backend(port, "org.example.second"));
+      // One server and issuer: only the grant partition tells them apart.
+      world.add(backend.backend("org.example.first"));
+      world.add(backend.backend("org.example.second"));
       world.start({ NODE_EXTRA_CA_CERTS: certificate!.file, BROWSER: "none" });
       await world.until(() => world.received.length > 0, "pi to start");
       const marker = world.ui.length;
@@ -1216,16 +1209,17 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       world.send({ type: "prompt", message: "/ahp status" });
       await world.until(() => world.uiOf("notify", status).some((request) => String(request.message).includes("org.example.second: needs-login")), "the status");
       expect(world.uiOf("notify", status).find((request) => String(request.message).includes("org.example.second: needs-login"))?.message).toContain("org.example.first: authorized");
-      expect(backend.registrations).toHaveLength(1);
+      // As in MCP clients, each sign-in registers its own client.
+      expect(backend.registrations).toHaveLength(2);
     } finally {
       await backend.stop();
     }
   }));
-  test("OAuth: a sign-in another pi completes clears this one's link at its next turn", () => inWorld(async (world) => {
+  test("OAuth: two pis sign in on their own: each link is its owner's, and the grant is shared", () => inWorld(async (world) => {
     const backend = await protectedBackend();
     const env = { NODE_EXTRA_CA_CERTS: (await tls()).file, BROWSER: "none" };
     try {
-      world.add(backend.backend(await freePort()));
+      world.add(backend.backend());
       world.start(env);
       await world.until(() => world.received.length > 0, "pi to start");
       // A link shown on request, not after a failed delivery.
@@ -1233,25 +1227,115 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       world.send({ type: "prompt", message: "/ahp status" });
       await world.until(() => world.uiOf("notify", marker).some((request) => String(request.message).includes("org.example.protected: needs-login")), "the status");
       const widget = () => world.uiOf("setWidget", marker).filter((request) => request.widgetKey === "agent-hooks-protocol-login");
-      expect(widget().at(-1)?.widgetLines?.[0]).toStartWith("Sign in to org.example.protected: ");
+      const mine = widget().at(-1)!.widgetLines[0].replace("Sign in to org.example.protected: ", "");
 
-      // The other pi reuses the same stored login, and completes it.
       const other = world.another(env);
       try {
-        other.send({ type: "prompt", message: "/ahp login org.example.protected" });
-        await world.until(() => other.ui.some((request) => request.method === "input"), "the other pi's paste box");
-        const link = other.ui.filter((request) => request.method === "setWidget").at(-1)!.widgetLines[0].replace("Sign in to org.example.protected: ", "");
-        expect(`Sign in to org.example.protected: ${link}`).toBe(widget().at(-1)!.widgetLines[0]);
-        other.send({ type: "extension_ui_response", id: other.ui.find((request) => request.method === "input")!.id, value: await backend.consent(link) });
-        await world.until(() => other.ui.some((request) => request.method === "notify" && request.message === "Signed in to org.example.protected."), "the other pi's sign-in");
+        // The other pi makes its own sign-in, on its own port.
+        other.send({ type: "prompt", message: "/ahp status" });
+        await world.until(() => other.ui.some((request) => request.method === "notify" && String(request.message).includes("org.example.protected: needs-login")), "the other pi's status");
+        const hint = () => other.ui.filter((request) => request.method === "setWidget" && request.widgetKey === "agent-hooks-protocol-login");
+        const theirs = hint().at(-1)!.widgetLines[0].replace("Sign in to org.example.protected: ", "");
+        const port = (link: string) => new URL(new URL(link).searchParams.get("redirect_uri")!).port;
+        expect(theirs).not.toBe(mine);
+        expect(port(theirs)).not.toBe(port(mine));
+        expect(backend.registrations).toHaveLength(2);
+
+        // A login completes only in the pi that owns it: this pi's redirect, sent to
+        // the other's listener, is refused there and leaves this login usable.
+        const redirect = new URL(await backend.consent(mine));
+        const stray = new URL(redirect.pathname + redirect.search, `http://127.0.0.1:${port(theirs)}`);
+        expect((await fetch(stray)).status).toBe(400);
+        expect(backend.issued.size).toBe(0);
+
+        // The person follows this pi's link: it signs in.
+        const signed = world.ui.length;
+        const landed = await fetch(await backend.consent(mine));
+        expect(landed.status).toBe(200);
+        await world.until(() => world.uiOf("notify", signed).some((request) => request.message === "Signed in to org.example.protected."), "this pi's sign-in");
+        expect(backend.issued.size).toBe(1);
+
+        // The other pi sees the shared grant at its next turn: its link goes, and its
+        // delivery carries the token this pi got.
+        const before = backend.received.length;
+        other.send({ type: "prompt", message: "after the first signed in" });
+        await world.until(() => hint().some((request) => !("widgetLines" in request)), "the other pi's link to clear");
+        await world.until(() => backend.received.length > before, "the other pi's authorized delivery");
+        expect(backend.received.at(-1)?.authorization).toBe(`Bearer ${[...backend.issued][0]}`);
+        // Its own login was cancelled: its listener is gone.
+        await expect(fetch(`http://127.0.0.1:${port(theirs)}/callback?state=x`)).rejects.toThrow();
       } finally {
         await other.stop();
       }
+    } finally {
+      await backend.stop();
+    }
+  }));
+  test("OAuth: pi -p \"/ahp login\" prints the link once and stays until the redirect arrives", () => inWorld(async (world) => {
+    const backend = await protectedBackend();
+    try {
+      world.add(backend.backend());
+      const child = Bun.spawn(["node", cli, "-e", installed, "--provider", "fake", "--model", "m", "-p", "/ahp login org.example.protected"], {
+        cwd: world.project,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+        env: { PATH: process.env.PATH!, HOME: world.home, PI_CODING_AGENT_DIR: world.agent, PI_OFFLINE: "1", AHP_HOOKS_FILE: join(world.dir, "hooks.json"), NODE_EXTRA_CA_CERTS: (await tls()).file, BROWSER: "none" },
+      });
+      let stderr = "";
+      let exited = false;
+      void child.exited.then(() => (exited = true));
+      void (async () => {
+        for await (const chunk of child.stderr as unknown as AsyncIterable<Uint8Array>) stderr += new TextDecoder().decode(chunk);
+      })();
+      const prefix = "Sign in to org.example.protected: ";
+      await world.until(() => stderr.includes(prefix) || exited, "the printed link");
+      const lines = stderr.split("\n").filter((line) => line.startsWith(prefix));
+      // Printed once, not by both the notice and the sign-in.
+      expect(lines).toHaveLength(1);
+      // Nothing else holds pi open: the sign-in must, while the person signs in.
+      await Bun.sleep(6000);
+      expect(exited).toBe(false);
+      const landed = await fetch(await backend.consent(lines[0]!.slice(prefix.length)));
+      expect(landed.status).toBe(200);
+      expect(await child.exited).toBe(0);
+      expect(stderr).toContain("Signed in to org.example.protected.");
+      expect(backend.issued.size).toBe(1);
+    } finally {
+      await backend.stop();
+    }
+  }));
 
-      const turn = world.ui.length;
-      await world.say("after the other signed in");
-      await world.until(() => world.uiOf("setWidget", turn).some((request) => request.widgetKey === "agent-hooks-protocol-login" && !("widgetLines" in request)), "the link to clear");
-      expect(backend.received.find((entry) => entry.type === "turn.start")?.authorization).toStartWith("Bearer ");
+  test("OAuth: a session that ends takes its links with it, so a later sign-out stays signed out", () => inWorld(async (world) => {
+    const backend = await protectedBackend();
+    try {
+      world.add(backend.backend());
+      world.start({ NODE_EXTRA_CA_CERTS: (await tls()).file, BROWSER: "none" });
+      await world.until(() => world.received.length > 0, "pi to start");
+      const link = async () => {
+        const marker = world.ui.length;
+        world.send({ type: "prompt", message: "/ahp status" });
+        await world.until(() => world.uiOf("notify", marker).some((request) => String(request.message).includes("org.example.protected: needs-login")), "the status");
+        return world.uiOf("setWidget", marker).filter((request) => request.widgetKey === "agent-hooks-protocol-login").at(-1)!.widgetLines[0].replace("Sign in to org.example.protected: ", "");
+      };
+      const old = await link();
+      world.send({ type: "new_session" });
+      await world.until(() => world.of("session.start").length === 2, "the new session");
+      // The ended session's listener is gone: its link signs nobody in.
+      await expect(fetch(await backend.consent(old))).rejects.toThrow();
+
+      // The new session's own link, then a sign-out: that link is dead too.
+      const fresh = await link();
+      expect(fresh).not.toBe(old);
+      const out = world.ui.length;
+      world.send({ type: "prompt", message: "/ahp logout org.example.protected" });
+      await world.until(() => world.uiOf("notify", out).some((request) => request.message === "Signed out of org.example.protected."), "the sign-out");
+      await expect(fetch(await backend.consent(fresh))).rejects.toThrow();
+      await expect(fetch(await backend.consent(old))).rejects.toThrow();
+      expect(backend.issued.size).toBe(0);
+      const status = world.ui.length;
+      world.send({ type: "prompt", message: "/ahp status" });
+      await world.until(() => world.uiOf("notify", status).some((request) => String(request.message).includes("org.example.protected: needs-login")), "the status after sign-out");
     } finally {
       await backend.stop();
     }

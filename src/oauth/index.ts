@@ -4,25 +4,21 @@
 // Deliveries never create a login. They fail `interaction_required`, and the
 // failure's diagnostic marks the backend; at the next turn the adapter prepares a
 // login in the background and shows its link where only the person sees it (a
-// widget and a notification, never the transcript). A pending login is stored and
-// reused until it expires, so every turn shows the same link. `/ahp login`,
-// `/ahp status` and `/ahp logout` are the explicit controls.
+// widget and a notification, never the transcript). `/ahp login`, `/ahp status`
+// and `/ahp logout` are the explicit controls.
+//
+// As in MCP clients, a login belongs to the pi that prepared it: it listens on a
+// port of its own for the redirect, keeps showing the same link until the login
+// ends, and completes it. Grants are shared through the store, so every pi uses
+// the newest sign-in, and drops its own link once it sees one.
 //
 // Each backend has its own grants: the grant partition is the backend id, so one
 // sign-in covers its event and upload endpoints, and no other backend's.
-import { auth, AuthError, type DeliveryAuthFailure, type DeliveryAuthProvider } from "agenthooksprotocol/client";
-import {
-  bindingKey,
-  frame,
-  managedOAuth,
-  type ClientConfig,
-  type Operation,
-  type PendingLogin,
-  type StoredRecord,
-} from "agenthooksprotocol/oauth";
+import { auth, AuthError, type DeliveryAuthContext, type DeliveryAuthFailure, type DeliveryAuthProvider } from "agenthooksprotocol/client";
+import { bindingKey, managedOAuth, type ClientConfig, type Operation, type PendingLogin, type StoredRecord } from "agenthooksprotocol/oauth";
 import { join } from "node:path";
-import { receive } from "./callback.js";
-import { networkPolicy } from "./network.js";
+import { receive, type Receiver } from "./callback.js";
+import { networkPolicy, type NetworkPolicy } from "./network.js";
 import { backendAuth, trustedIssuer, type BackendAuth, type Endpoint } from "./settings.js";
 import { FileSecrets, FileTokenStore } from "./store.js";
 
@@ -30,7 +26,6 @@ export const NAMESPACE = "dev.pi";
 const SOFTWARE_ID = "@agenthooksprotocol/adapter-pi";
 const DELIVERY_BUDGET_MS = 60_000;
 const PREPARE_BUDGET_MS = 60_000;
-const POLL_MS = 250;
 
 /** What the logins need from pi. Every call reads the latest session context. */
 export interface LoginHost {
@@ -50,9 +45,73 @@ interface Backend extends BackendAuth {
   oauth: Managed;
 }
 
+/** A login this pi prepared, and the listener for its redirect. */
+interface Active {
+  login: PendingLogin;
+  receiver: Receiver;
+  /** Scopes it was prepared for: a grant from elsewhere must cover them. */
+  required: readonly string[];
+  /** The grant when it was prepared: a newer one means someone signed in. */
+  grant: { key: string; record: StoredRecord | undefined } | undefined;
+  expiry?: ReturnType<typeof setTimeout>;
+  /** `/ahp login` waiting for the login to end. */
+  waiters: (() => void)[];
+  /** Set once the login has ended: nothing waits on it after that. */
+  ended?: boolean;
+}
+
+/** Where OAuth requests may go; tests substitute their own. */
+export interface LoginOptions {
+  network?: (allowPrivateNetwork: boolean) => NetworkPolicy;
+}
+
 function budget(ms: number, signal?: AbortSignal): Operation {
   return { signal: signal ?? new AbortController().signal, deadline: Date.now() + ms };
 }
+
+/** Whether `value` is an address on this redirect: the one a browser ends on. */
+function onRedirect(value: string, redirectUri: string): boolean {
+  try {
+    const actual = new URL(value), expected = new URL(redirectUri);
+    return actual.origin === expected.origin && actual.pathname === expected.pathname;
+  } catch {
+    return false;
+  }
+}
+
+function stateOf(callback: string): string | null {
+  try {
+    return new URL(callback).searchParams.get("state");
+  } catch {
+    return null;
+  }
+}
+
+/** The scopes an endpoint's oauth binding names. */
+function bindingScopes(binding: Record<string, unknown> | undefined): string[] {
+  return binding?.type === "oauth" && Array.isArray(binding.scopes) ? (binding.scopes as string[]) : [];
+}
+
+/** The scopes an endpoint may have, as `#select` gives them: oauth.scopes, else
+ * its binding's. */
+function allowedAt(backend: BackendAuth, endpoint: Endpoint): string[] {
+  return backend.settings.scopes ?? bindingScopes(endpoint.authentication);
+}
+
+/** An access_denied that named scopes. `outside`: allowed on no endpoint.
+ * `partial`: allowed on some endpoints, not on the one refused. `unclear`:
+ * allowed where it may have been refused, so the issuer may simply have granted
+ * fewer. Only outside and partial are refusals a person can act on. */
+interface Refusal {
+  required: readonly string[];
+  outside: string[];
+  partial: string[];
+  unclear: string[];
+}
+
+/** Where a failure is shown: a prepare's own failure, or one a delivery or
+ * configuration discovery reported. */
+type Source = "prepare" | "delivery";
 
 function code(error: unknown): string {
   return error instanceof AuthError ? error.code : error instanceof Error && error.name === "TimeoutError" ? "timeout" : "provider_failed";
@@ -66,19 +125,30 @@ export class Logins {
   readonly #backends = new Map<string, Backend>();
   /** Backends whose last delivery needs a login, with the scopes it needed. */
   readonly #needed = new Map<string, readonly string[] | undefined>();
-  /** The last authentication failure that a login will not fix. */
-  readonly #failing = new Map<string, string>();
-  readonly #pending = new Map<string, PendingLogin>();
-  readonly #preparing = new Set<string>();
+  /** The last authentication failure a delivery or configuration discovery
+   * reported that a login will not fix. */
+  readonly #deliveryFailures = new Map<string, string>();
+  /** The last failure of this pi's own prepare. */
+  readonly #prepareFailures = new Map<string, string>();
+  readonly #active = new Map<string, Active>();
+  readonly #ensuring = new Map<string, Promise<"ready" | Active | string>>();
   readonly #told = new Set<string>();
+  /** The last access_denied naming scopes a person can act on: a past
+   * observation. The allowed scopes are fixed for this instance, so it recurs
+   * whenever the backend asks again; only a sign-out (or a reload) clears it. */
+  readonly #refusals = new Map<string, Refusal>();
+  /** The last prepare's scoped access_denied, for its own failure's hint. */
+  readonly #prepareRefusals = new Map<string, Refusal>();
 
-  constructor(readonly host: LoginHost, agentDir: string, backends: readonly Record<string, unknown>[]) {
+  constructor(readonly host: LoginHost, agentDir: string, backends: readonly Record<string, unknown>[], options: LoginOptions = {}) {
     this.store = new FileTokenStore(join(agentDir, "ahp-auth.json"));
     this.secrets = new FileSecrets(join(agentDir, "ahp-secrets.json"));
+    // Earlier versions kept pending logins, PKCE verifiers included, in the store.
+    void this.store.dropExpiredLogins(AbortSignal.timeout(30_000)).catch(() => {});
     for (const raw of backends) {
       const { auth: backend, problems } = backendAuth(raw);
       this.problems.push(...problems);
-      const network = networkPolicy(backend.settings.allowPrivateNetwork);
+      const network = (options.network ?? networkPolicy)(backend.settings.allowPrivateNetwork);
       const oauth = managedOAuth({
         namespace: NAMESPACE,
         store: this.store,
@@ -99,6 +169,11 @@ export class Logins {
     const oauth: DeliveryAuthProvider = {
       credential: (context) => route(context.backendId).credential(context),
       challenge: (context) => route(context.backendId).challenge(context),
+      // A sign-in lets Hooks retry a backend whose configuration discovery it skipped.
+      onPrepared: (listener) => {
+        const stops = [...providers.values()].map((provider) => provider.onPrepared!(listener));
+        return () => stops.forEach((stop) => stop());
+      },
     };
     this.provider = auth.compose({
       bearer: auth.bearer({ resolveCredentialReference: (reference, context) => this.secrets.get(reference, context.signal ?? new AbortController().signal) }),
@@ -128,7 +203,7 @@ export class Logins {
       clientSecret = await this.secrets.get(secretRef, operation.signal);
       if (clientSecret === undefined) throw new AuthError("credential_unavailable");
     }
-    const scopes = settings.scopes ?? (Array.isArray(preset?.scopes) ? (preset.scopes as string[]) : []);
+    const scopes = settings.scopes ?? bindingScopes(preset);
     return {
       issuer,
       resource,
@@ -137,7 +212,6 @@ export class Logins {
       grantPartition: backend.id,
       ...(clientId !== undefined ? { clientId } : {}),
       ...(clientSecret !== undefined ? { clientSecret } : {}),
-      ...(flow === "authorization_code_pkce" ? { redirectUri: backend.redirectUri } : {}),
       ...(settings.clientMetadataDocument ? { clientMetadataDocument: settings.clientMetadataDocument } : {}),
       ...(settings.registration && issuer === settings.issuer
         ? { registration: { clientName: "pi (Agent Hooks Protocol)", softwareId: SOFTWARE_ID, ...settings.registration } }
@@ -149,60 +223,127 @@ export class Logins {
     return [...this.#backends.keys()];
   }
 
-  /** A delivery's or initialization's authentication failure. */
-  observe(backendId: string, failure: DeliveryAuthFailure | undefined): void {
+  /** A delivery's or initialization's authentication failure, and the endpoint
+   * it happened at when known (configuration discovery: the event endpoint). */
+  observe(backendId: string, failure: DeliveryAuthFailure | undefined, purpose?: Endpoint["purpose"]): void {
     if (!failure || !this.#backends.has(backendId)) return;
     if (failure.recovery === "login") {
       if (!this.#needed.has(backendId)) this.#told.delete(backendId);
-      this.#needed.set(backendId, failure.requiredScopes);
-      this.#failing.delete(backendId);
+      // Step-up scopes stay needed until a grant covers them: a later failure that
+      // names none does not drop them.
+      const scopes = [...new Set([...(this.#needed.get(backendId) ?? []), ...(failure.requiredScopes ?? [])])];
+      this.#needed.set(backendId, scopes.length ? scopes : undefined);
+      this.#deliveryFailures.delete(backendId);
     } else {
-      this.#failing.set(backendId, failure.code);
+      // A scoped access_denied is a refusal (or the issuer granting fewer), kept below.
+      // A retryable one (a token endpoint's 503, say) is logged only: no later
+      // success would clear it.
+      if (failure.recovery === "retry") this.host.log(`${backendId}: delivery failed: ${failure.code}; will retry`);
+      else if (!(failure.code === "access_denied" && failure.requiredScopes?.length)) this.#deliveryFailures.set(backendId, failure.code);
+      // The SDK refuses a step-up beyond the ceiling itself, naming the scopes. One
+      // naming none is something else, and leaves a recorded refusal as it was.
+      if (failure.code === "access_denied" && failure.requiredScopes?.length) {
+        const backend = this.#backends.get(backendId)!;
+        // Several endpoints of that purpose: which one refused is unknown.
+        const candidates = backend.endpoints.filter((endpoint) => endpoint.purpose === purpose);
+        const refusal = this.#judge(backend, failure.requiredScopes, candidates.length === 1 ? candidates[0] : undefined);
+        if (refusal.unclear.length) this.host.log(`${backendId}: refused ${refusal.unclear.join(" ")}, which an endpoint allows: the issuer may have granted fewer`);
+        if (refusal.outside.length || refusal.partial.length) this.#refusals.set(backendId, refusal);
+      }
     }
   }
 
-  /** A turn starts: prepare, in the background, each login a delivery asked for. */
+  /** Judge scopes an access_denied named against what each endpoint may have.
+   * `endpoint`: where it was refused. Unknown (a delivery does not say), a scope
+   * the event endpoint allows is unclear: it may be the issuer granting fewer. */
+  #judge(backend: BackendAuth, required: readonly string[], endpoint: Endpoint | undefined): Refusal {
+    const union = new Set(backend.endpoints.flatMap((one) => allowedAt(backend, one)));
+    const at = endpoint ?? backend.endpoints[0];
+    const allowed = at ? allowedAt(backend, at) : [];
+    const outside = required.filter((scope) => !union.has(scope));
+    const partial = required.filter((scope) => union.has(scope) && !allowed.includes(scope));
+    const unclear = endpoint ? [] : required.filter((scope) => union.has(scope) && allowed.includes(scope));
+    return { required, outside, partial, unclear };
+  }
+
+  /** What the backend last refused that a person can act on. */
+  #refusal(id: string): Refusal | undefined {
+    return this.#refusals.get(id);
+  }
+
+  /** A turn starts: prepare, in the background, each login a delivery asked for,
+   * and drop the links of logins another pi made unnecessary. */
   turnStart(): void {
-    // And each link shown: another pi may have completed it, or released its port.
-    for (const id of new Set([...this.#needed.keys(), ...this.#pending.keys()])) {
-      if (this.#preparing.has(id)) continue;
+    for (const id of new Set([...this.#needed.keys(), ...this.#active.keys()])) {
       if (!this.host.hasUI) {
         // No one to show a link to, and nothing listening once this run ends.
         if (!this.#told.has(id)) this.host.notify(`Agent Hooks Protocol: ${id} needs a sign-in; run /ahp login ${id} in an interactive pi.`, "warning");
         this.#told.add(id);
         continue;
       }
-      this.#preparing.add(id);
-      void this.#hint(id).finally(() => this.#preparing.delete(id));
+      void this.#ensure(this.#backends.get(id)!).then((result) => {
+        if (typeof result === "string" && result !== "ready") this.host.log(`${id}: sign-in not prepared: ${result}`);
+      });
     }
   }
 
-  async #hint(id: string): Promise<void> {
-    const backend = this.#backends.get(id)!;
-    // The stored login this process already shows: nothing to prepare.
-    const shown = this.#pending.get(id);
-    if (shown && shown.expiresAt > Date.now() && (await this.#stillPending(backend, shown))) return this.#listen(backend, shown);
-    const result = await this.#prepare(backend);
-    if (typeof result === "string") this.host.log(`${id}: sign-in not prepared: ${result}`);
+  /** Signed in, this pi's own live login (prepared now if there is none), or a failure code. */
+  #ensure(backend: Backend): Promise<"ready" | Active | string> {
+    const running = this.#ensuring.get(backend.id);
+    if (running) return running;
+    const work = (async () => {
+      const active = this.#active.get(backend.id);
+      if (active) {
+        // A login prepared before a delivery asked for more scopes cannot grant them.
+        const covers = (this.#needed.get(backend.id) ?? []).every((scope) => active.required.includes(scope));
+        if (covers && active.login.expiresAt > Date.now() && !(await this.#grantedElsewhere(active)) && this.#active.get(backend.id) === active) return active;
+        await this.#end(backend, active);
+      }
+      return this.#prepare(backend);
+    })().finally(() => this.#ensuring.delete(backend.id));
+    this.#ensuring.set(backend.id, work);
+    return work;
   }
 
-  /** Host prepare: ready, a pending login (shown and received), or a failure code. */
-  async #prepare(backend: Backend): Promise<"ready" | PendingLogin | string> {
+  /** Host prepare, with a listener of its own for the login it may create. */
+  async #prepare(backend: Backend): Promise<"ready" | Active | string> {
     const endpoint = backend.endpoints[0];
     if (!endpoint) return "unsupported_binding";
     const requiredScopes = this.#needed.get(backend.id);
+    this.#prepareFailures.delete(backend.id);
+    let receiver: Receiver | undefined;
     try {
-      const result = await backend.oauth.prepare(this.#context(backend, endpoint), budget(PREPARE_BUDGET_MS), requiredScopes ? { requiredScopes } : {});
+      receiver = await receive((callback) => this.#complete(backend, callback));
+      const context = this.#context(backend, endpoint);
+      const result = await backend.oauth.prepare(context, budget(PREPARE_BUDGET_MS), { redirectUri: receiver.redirectUri, ...(requiredScopes ? { requiredScopes } : {}) });
       if (result.type === "ready") {
-        this.#done(backend.id);
+        receiver.close();
+        // Ready is not a sign-in: what deliveries reported still stands.
+        this.#done(backend.id, requiredScopes ?? [], false);
         return "ready";
       }
-      await this.#show(backend, result);
-      return result;
+      receiver.state = result.state;
+      const active: Active = { login: result, receiver, required: requiredScopes ?? [], grant: await this.#grant(context), waiters: [] };
+      active.expiry = setTimeout(() => void this.#end(backend, active), Math.max(0, result.expiresAt - Date.now()));
+      active.expiry.unref();
+      this.#active.set(backend.id, active);
+      this.#render();
+      this.host.notify(`Sign in to ${backend.id}: ${result.authorizationUrl}`);
+      return active;
     } catch (error) {
+      receiver?.close();
       const failure = code(error);
-      this.#needed.delete(backend.id);
-      this.#failing.set(backend.id, failure);
+      // Step-up scopes beyond the ceiling fail access_denied, naming them.
+      this.#prepareRefusals.delete(backend.id);
+      if (error instanceof AuthError && error.code === "access_denied" && error.requiredScopes?.length) {
+        const refusal = this.#judge(backend, error.requiredScopes, endpoint);
+        this.#prepareRefusals.set(backend.id, refusal);
+        if (refusal.outside.length || refusal.partial.length) this.#refusals.set(backend.id, refusal);
+      }
+      // A transient failure keeps the scopes deliveries asked for, for the next try.
+      const retryable = failure === "timeout" || (error instanceof AuthError && error.recovery === "retry");
+      if (!retryable) this.#needed.delete(backend.id);
+      this.#prepareFailures.set(backend.id, failure);
       return failure;
     }
   }
@@ -211,68 +352,115 @@ export class Logins {
     return { backendId: backend.id, purpose: endpoint.purpose, url: endpoint.url, ...(endpoint.authentication ? { authentication: endpoint.authentication as never } : {}) };
   }
 
-  #pendingKey(backend: BackendAuth, endpoint: Endpoint): string {
-    return frame("ahp.oauth.pending:", [bindingKey(NAMESPACE, this.#context(backend, endpoint))]);
+  /** The stored grant this endpoint's binding names, if any. */
+  async #grant(context: DeliveryAuthContext): Promise<{ key: string; record: StoredRecord | undefined } | undefined> {
+    const signal = AbortSignal.timeout(10_000);
+    const binding = await this.store.load(bindingKey(NAMESPACE, context), signal).catch(() => undefined);
+    const key = binding?.kind === "binding" ? binding.grantKey : undefined;
+    return key ? { key, record: await this.store.load(key, signal).catch(() => undefined) } : undefined;
   }
 
-  async #load(key: string): Promise<StoredRecord | undefined> {
-    return this.store.load(key, AbortSignal.timeout(10_000));
+  /** Another pi completed a sign-in since this login was prepared: the grant, shared
+   * through the store, now has tokens covering what this login asked for. */
+  async #grantedElsewhere(active: Active): Promise<boolean> {
+    if (!active.grant) return false;
+    const record = await this.store.load(active.grant.key, AbortSignal.timeout(10_000)).catch(() => undefined);
+    if (record?.kind !== "grant" || record.generation === active.grant.record?.generation) return false;
+    return (record.token !== undefined || record.refreshToken !== undefined) && active.required.every((scope) => record.scopes.includes(scope));
   }
 
-  async #stillPending(backend: BackendAuth, login: PendingLogin): Promise<boolean> {
-    const record = await this.#load(login.key).catch(() => undefined);
-    return record?.kind === "pending_login" && record.id === login.id && record.expiresAt > Date.now();
-  }
-
-  /** Listen for the login's whole lifetime, and show its link. */
-  async #show(backend: Backend, login: PendingLogin): Promise<void> {
-    const previous = this.#pending.get(backend.id);
-    this.#pending.set(backend.id, login);
-    await this.#listen(backend, login);
-    this.#render();
-    if (previous?.authorizationUrl !== login.authorizationUrl) this.host.notify(`Sign in to ${backend.id}: ${login.authorizationUrl}`);
-  }
-
-  /** Receive the login's redirect, or keep trying while another pi holds the port. */
-  async #listen(backend: Backend, login: PendingLogin): Promise<void> {
-    await receive(backend.settings.redirectPort, login.expiresAt + 5_000, backend.id, (callback) => this.#callback(backend, callback))
-      .catch((error) => this.host.log(`${backend.id}: no callback listener: ${String(error)}`));
-  }
-
-  /** A redirect reached the listener: complete the login it belongs to. */
-  async #callback(backend: Backend, callback: string): Promise<{ ok: boolean; message: string } | undefined> {
-    const endpoint = backend.endpoints[0];
-    if (!endpoint) return undefined;
-    const key = this.#pendingKey(backend, endpoint);
-    const record = await this.#load(key);
-    if (record?.kind !== "pending_login" || new URL(callback).searchParams.get("state") !== record.state) return undefined;
-    const login: PendingLogin = { type: "pending_login", authorizationUrl: record.authorizationUrl, expiresAt: record.expiresAt, key, id: record.id };
-    return this.#complete(backend, login, callback);
-  }
-
-  async #complete(backend: Backend, login: PendingLogin, callback: string): Promise<{ ok: boolean; message: string }> {
+  /** A redirect reached this login's listener, or was pasted into this pi. */
+  async #complete(backend: Backend, callback: string): Promise<{ ok: boolean; message: string }> {
     try {
-      await backend.oauth.complete(login, callback, budget(PREPARE_BUDGET_MS));
-      this.#done(backend.id);
+      const active = this.#active.get(backend.id);
+      const completed = active && stateOf(callback) === active.login.state ? active.required : [];
+      await backend.oauth.complete(callback, budget(PREPARE_BUDGET_MS));
+      this.#done(backend.id, completed);
       this.host.notify(`Signed in to ${backend.id}.`);
       return { ok: true, message: `Signed in to ${backend.id}. You can close this tab.` };
     } catch (error) {
       const failure = code(error);
+      const active = this.#active.get(backend.id);
+      const state = stateOf(callback);
+      if (active && state !== null && state !== active.login.state && !active.ended) {
+        this.host.notify(`That address is from another sign-in to ${backend.id}; this one is still waiting.`, "warning");
+        return { ok: false, message: `This address is from another sign-in to ${backend.id}. The current sign-in is still waiting in pi.` };
+      }
+      if (active && state === active.login.state) {
+        // A callback the SDK refused before using it (a wrong address, issuer or a
+        // stray request) leaves the login waiting for the real one.
+        if (await this.#live(backend, active)) {
+          if (this.#active.get(backend.id) === active) active.receiver.state = active.login.state;
+          this.host.notify(`Sign-in to ${backend.id} failed: ${failure}. Its link still works.`, "warning");
+          return { ok: false, message: `This did not complete the sign-in to ${backend.id} (${failure}). The sign-in is still waiting in pi.` };
+        }
+        // A login the SDK used up has ended; the next turn or /ahp login makes another.
+        await this.#end(backend, active);
+      }
+      // Fewer scopes granted than the login asked for: trying again changes nothing.
+      if (error instanceof AuthError && error.code === "access_denied" && error.requiredScopes?.length) {
+        const why = hint(failure, this.#judge(backend, error.requiredScopes, backend.endpoints[0]), "prepare");
+        this.host.notify(`Sign-in to ${backend.id} failed: ${failure}${why}.`, "warning");
+        return { ok: false, message: `Sign-in to ${backend.id} failed: ${failure}${why}.` };
+      }
       this.host.notify(`Sign-in to ${backend.id} failed: ${failure}.`, "warning");
       return { ok: false, message: `Sign-in to ${backend.id} failed (${failure}). Run /ahp login ${backend.id} in pi to try again.` };
     }
   }
 
-  #done(id: string): void {
-    this.#needed.delete(id);
-    this.#failing.delete(id);
-    this.#told.delete(id);
-    if (this.#pending.delete(id)) this.#render();
+  /** Whether the SDK still holds this login. It refuses a callback on another
+   * path before anything can consume the login, and fails interaction_required
+   * only for one that has ended (used, cancelled or expired). */
+  async #live(backend: Backend, active: Active): Promise<boolean> {
+    if (active.login.expiresAt <= Date.now()) return false;
+    const probe = new URL(active.receiver.redirectUri);
+    probe.pathname += "/probe";
+    probe.search = new URLSearchParams({ state: active.login.state }).toString();
+    try {
+      await backend.oauth.complete(probe.href, budget(10_000));
+      return false;
+    } catch (error) {
+      return code(error) !== "interaction_required";
+    }
+  }
+
+  /** End this pi's login: expired, failed, superseded or signed out. */
+  async #end(backend: Backend, active: Active): Promise<void> {
+    if (this.#active.get(backend.id) !== active) return;
+    this.#active.delete(backend.id);
+    this.#stop(active);
+    this.#render();
+    await backend.oauth.cancel(active.login, budget(10_000)).catch(() => {});
+  }
+
+  #stop(active: Active): void {
+    active.ended = true;
+    clearTimeout(active.expiry);
+    active.receiver.close();
+    for (const settle of active.waiters.splice(0)) settle();
+  }
+
+  /** A grant now covers `covered` (everything, when signing out): the scopes
+   * still needed beyond it wait for the next login. */
+  #done(id: string, covered?: readonly string[], signedIn = true): void {
+    const needed = this.#needed.get(id);
+    const remaining = covered && needed ? needed.filter((scope) => !covered.includes(scope)) : [];
+    if (remaining.length) this.#needed.set(id, remaining);
+    else {
+      this.#needed.delete(id);
+      this.#told.delete(id);
+    }
+    if (signedIn) this.#deliveryFailures.delete(id);
+    this.#prepareFailures.delete(id);
+    const active = this.#active.get(id);
+    if (!active) return;
+    this.#active.delete(id);
+    this.#stop(active);
+    this.#render();
   }
 
   #render(): void {
-    const now = Date.now();
-    const lines = [...this.#pending].filter(([, login]) => login.expiresAt > now).map(([id, login]) => `Sign in to ${id}: ${login.authorizationUrl}`);
+    const lines = [...this.#active].map(([id, active]) => `Sign in to ${id}: ${active.login.authorizationUrl}`);
     try {
       this.host.widget(lines.length ? lines : undefined);
     } catch {
@@ -284,8 +472,8 @@ export class Logins {
   async #relevant(backend: BackendAuth): Promise<boolean> {
     const endpoint = backend.endpoints[0];
     if (!endpoint || backend.headerAuthorization || backend.preset?.type === "bearer") return false;
-    if (backend.preset?.type === "oauth" || backend.configured || this.#needed.has(backend.id) || this.#failing.has(backend.id)) return true;
-    const binding = await this.#load(bindingKey(NAMESPACE, this.#context(backend, endpoint))).catch(() => undefined);
+    if (backend.preset?.type === "oauth" || backend.configured || this.#needed.has(backend.id) || this.#deliveryFailures.has(backend.id) || this.#prepareFailures.has(backend.id)) return true;
+    const binding = await this.store.load(bindingKey(NAMESPACE, this.#context(backend, endpoint)), AbortSignal.timeout(10_000)).catch(() => undefined);
     return binding !== undefined;
   }
 
@@ -316,97 +504,135 @@ export class Logins {
     if (backend.headerAuthorization) return "Authorization header from hooks.json";
     if (backend.preset?.type === "bearer") return "bearer token from hooks.json";
     if (!(await this.#relevant(backend))) return "no sign-in needed";
-    const failing = this.#failing.get(backend.id);
-    const result = await this.#prepare(backend);
+    const delivery = this.#deliveryFailures.get(backend.id);
+    const result = await this.#ensure(backend);
+    const refusal = this.#refusal(backend.id);
     if (result === "ready") {
       const flow = backend.settings.flow ?? backend.preset?.flow;
-      return flow === "client_credentials" ? "client-credentials" : "authorized";
+      const refused = refusal ? `; last refused${hint("access_denied", refusal, "delivery")}` : "";
+      const failed = delivery ? `; last delivery: ${delivery}${hint(delivery, undefined, "delivery")}` : "";
+      return `${flow === "client_credentials" ? "client-credentials" : "authorized"}${refused}${failed}`;
     }
-    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result)}`;
-    return `needs-login: ${result.authorizationUrl}`;
+    if (typeof result === "string") {
+      const own = `failing: ${result}${hint(result, this.#prepareRefusals.get(backend.id), "prepare")}`;
+      // A delivery failing the same way is this failure again, already explained.
+      const failed = delivery && delivery !== result ? `; last delivery: ${delivery}${hint(delivery, undefined, "delivery")}` : "";
+      return `${own}${failed}${refusal ? `; last refused${hint("access_denied", refusal, "delivery")}` : ""}`;
+    }
+    return `needs-login: ${result.login.authorizationUrl}`;
   }
 
   async #login(target: string | undefined): Promise<void> {
     const backends = target ? [this.#backends.get(target)!] : [...this.#backends.values()];
     let walked = 0;
+    /** Backends that were reported on: a closing "nothing needed" would contradict. */
+    let reported = 0;
     for (const backend of backends) {
       if (!target && !(await this.#relevant(backend))) continue;
       if (!backend.endpoints.length) {
         this.host.notify(`${backend.id} is a local process: it has no sign-in.`, "warning");
         continue;
       }
-      const result = await this.#prepare(backend);
+      const result = await this.#ensure(backend);
+      const refusal = this.#refusal(backend.id);
+      if (result === "ready" && refusal) {
+        this.host.notify(`${backend.id} is signed in, but was last refused${hint("access_denied", refusal, "delivery")}: a sign-in cannot fix that.`, "warning");
+        reported++;
+        continue;
+      }
       if (result === "ready") {
         if (target) this.host.notify(`${backend.id} is already signed in. /ahp logout ${backend.id} first to sign in as someone else.`);
         continue;
       }
       if (typeof result === "string") {
-        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result)}`, "warning");
+        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result, this.#prepareRefusals.get(backend.id), "prepare")}`, "warning");
+        reported++;
         continue;
       }
       walked++;
       await this.#signIn(backend, result);
     }
-    if (!target && walked === 0) this.host.notify("No backend needs a sign-in.");
+    if (!target && walked === 0 && reported === 0) this.host.notify("No backend needs a sign-in.");
   }
 
   /** Open the browser and wait for the redirect, or for a pasted one. */
-  async #signIn(backend: Backend, login: PendingLogin): Promise<void> {
-    this.host.open(login.authorizationUrl);
-    const stop = new AbortController();
-    const received = this.#untilEnded(backend, login, stop.signal).then(() => ({ type: "received" as const }));
-    const contenders: Promise<{ type: "received" } | { type: "pasted"; value: string | undefined }>[] = [received];
-    if (this.host.hasUI) {
-      contenders.push(this.host.input(`Sign in to ${backend.id}`, "If the browser cannot reach pi, paste the address it ended on", stop.signal).then((value) => ({ type: "pasted" as const, value })));
-    } else {
-      console.error(`Sign in to ${backend.id}: ${login.authorizationUrl}`);
-    }
-    const first = await Promise.race(contenders);
-    stop.abort();
-    await received.catch(() => {});
-    if (first.type === "pasted") {
-      if (first.value?.trim()) await this.#complete(backend, login, first.value.trim());
-      return;
-    }
-    // Completed here or by another pi, cancelled, or expired.
-    if (this.#pending.get(backend.id)?.id === login.id) {
-      const result = await this.#prepare(backend);
-      if (result !== "ready") this.host.notify(`Sign-in to ${backend.id} did not complete.`, "warning");
-      else this.host.notify(`Signed in to ${backend.id}.`);
+  async #signIn(backend: Backend, active: Active): Promise<void> {
+    // Ended since it was prepared: there is nothing to wait for.
+    if (active.ended) return;
+    this.host.open(active.login.authorizationUrl);
+    const ended = new Promise<{ type: "ended" }>((resolve) => {
+      if (active.ended) resolve({ type: "ended" });
+      else active.waiters.push(() => resolve({ type: "ended" }));
+    });
+    // The listener never keeps pi alive by itself: while a person is asked to sign
+    // in (`pi -p "/ahp login …"` too), this does, until the login ends.
+    const hold = setTimeout(() => {}, Math.max(0, active.login.expiresAt - Date.now()));
+    try {
+      for (;;) {
+        const stop = new AbortController();
+        const contenders: Promise<{ type: "ended" } | { type: "pasted"; value: string | undefined }>[] = [ended];
+        if (this.host.hasUI) {
+          contenders.push(this.host.input(`Sign in to ${backend.id}`, "If the browser cannot reach pi, paste the address it ended on", stop.signal).then((value) => ({ type: "pasted" as const, value })));
+        }
+        const first = await Promise.race(contenders);
+        stop.abort();
+        const value = first.type === "pasted" ? first.value?.trim() : undefined;
+        if (!value) return;
+        // Not the redirect (the sign-in link itself, say): the login stays as it was.
+        if (!onRedirect(value, active.receiver.redirectUri)) {
+          this.host.notify(`That is not where the browser ended. Paste the address that starts with ${active.receiver.redirectUri}.`, "warning");
+          continue;
+        }
+        // The paste completes here, in the pi that owns the login.
+        const result = await this.#complete(backend, value);
+        if (result.ok || active.ended) return;
+      }
+    } finally {
+      clearTimeout(hold);
     }
   }
 
-  async #untilEnded(backend: BackendAuth, login: PendingLogin, signal: AbortSignal): Promise<void> {
-    while (!signal.aborted && (await this.#stillPending(backend, login))) {
-      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
-    }
+  /** The session ends (or pi replaces this instance): every login this pi shows
+   * ends with it, so an old link can never sign anyone in. */
+  async close(): Promise<void> {
+    await Promise.all([...this.#active].map(([id, active]) => this.#end(this.#backends.get(id)!, active)));
   }
 
   async #logout(id: string): Promise<void> {
     const backend = this.#backends.get(id)!;
     const signal = AbortSignal.timeout(30_000);
+    const active = this.#active.get(id);
+    if (active) await this.#end(backend, active);
     for (const endpoint of backend.endpoints) {
-      const key = this.#pendingKey(backend, endpoint);
-      const pending = await this.store.load(key, signal);
-      if (pending?.kind === "pending_login") {
-        await backend.oauth.cancel({ type: "pending_login", authorizationUrl: pending.authorizationUrl, expiresAt: pending.expiresAt, key, id: pending.id }, budget(30_000));
-      }
-      const binding = await this.store.load(bindingKey(NAMESPACE, this.#context(backend, endpoint)), signal);
-      const grantKey = binding?.kind === "binding" ? binding.grantKey : undefined;
-      if (!grantKey) continue;
-      await this.store.coordinate(grantKey, signal, async () => {
-        const grant = await this.store.load(grantKey, signal);
-        if (grant) await this.store.compareAndSet(grantKey, grant.generation, undefined, signal);
+      const grant = await this.#grant(this.#context(backend, endpoint));
+      if (!grant) continue;
+      await this.store.coordinate(grant.key, signal, async () => {
+        const record = await this.store.load(grant.key, signal);
+        if (record) await this.store.compareAndSet(grant.key, record.generation, undefined, signal);
       });
     }
     this.#done(id);
+    this.#refusals.delete(id);
+    this.#prepareRefusals.delete(id);
     this.host.notify(`Signed out of ${id}.`);
   }
 }
 
-function hint(failure: string): string {
+function hint(failure: string, refusal: Refusal | undefined, source: Source): string {
   if (failure === "credential_unavailable") return " (no client: set oauth.clientId, oauth.clientMetadataDocument, or oauth.issuer with oauth.registration in hooks.json)";
-  if (failure === "access_denied") return " (the issuer is not trusted: set oauth.issuer, or oauth.trustAdvertisedIssuer for a browser sign-in, in hooks.json)";
+  if (failure === "access_denied" && refusal) {
+    const parts: string[] = [];
+    if (refusal.outside.length) parts.push(`it needs scopes this backend is not allowed: ${refusal.outside.join(" ")}; add them to oauth.scopes in hooks.json to allow them`);
+    if (refusal.partial.length) parts.push(`it needs scopes not allowed on every endpoint: ${refusal.partial.join(" ")}; set oauth.scopes in hooks.json`);
+    // Every scope was allowed: the issuer granted fewer than asked for.
+    if (!parts.length) parts.push(`the issuer did not grant ${refusal.required.join(" ")}`);
+    return ` (${parts.join("; ")})`;
+  }
+  // A sign-in's own bare access_denied is local issuer trust. A delivery's may be
+  // that too, or a token endpoint's denial: no more is known.
+  if (failure === "access_denied") {
+    return source === "prepare" ? " (the issuer is not trusted: set oauth.issuer, or oauth.trustAdvertisedIssuer for a browser sign-in, in hooks.json)" : " (access was denied)";
+  }
   if (failure === "untrusted_destination") return " (a private address: set oauth.allowPrivateNetwork in hooks.json)";
   return "";
 }

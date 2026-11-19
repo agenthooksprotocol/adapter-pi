@@ -23,12 +23,14 @@ export default function agentHooksProtocol(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       adapter.ctx = ctx;
       if (!adapter.logins) return adapter.notify("Agent Hooks Protocol: no backends are registered.", "warning");
+      adapter.initialization();
       await adapter.logins.command(args);
     },
   });
   // A turn begins: show the links of the sign-ins its backends asked for.
   pi.on("agent_start", (_event, ctx) => {
     adapter.ctx = ctx;
+    adapter.initialization();
     adapter.logins?.turnStart();
   });
 }

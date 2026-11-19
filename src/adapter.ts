@@ -18,6 +18,14 @@ export const CUSTOM_TYPE = "agent-hooks-protocol";
 
 const LOGIN_WIDGET = "agent-hooks-protocol-login";
 
+/** The entries of `list` not in `seen`, now marked seen. Hooks appends to its
+ * diagnostics and drops old ones, so position is no cursor: identity is. */
+export function unseen<T extends object>(list: readonly T[], seen: WeakSet<object>): T[] {
+  const fresh = list.filter((entry) => !seen.has(entry));
+  for (const entry of fresh) seen.add(entry);
+  return fresh;
+}
+
 /** The command that opens a link: $BROWSER (empty or "none" for none), or the platform's. */
 function browser(): string[] {
   const chosen = process.env.BROWSER;
@@ -93,6 +101,8 @@ export class Adapter {
   /** OAuth for the registration's backends; undefined without a registration. */
   logins: Logins | undefined;
   #queue: Promise<unknown> = Promise.resolve();
+  /** Initialization diagnostics already read. */
+  readonly #seen = new WeakSet<object>();
 
   constructor(readonly pi: ExtensionAPI) {}
 
@@ -124,13 +134,8 @@ export class Adapter {
         for (const line of this.logins.problems) this.warn(`Agent Hooks Protocol: ${line}`);
       }
       const hooks = await this.#client(registration);
-      for (const issue of hooks.initializationDiagnostics ?? []) {
-        this.logins?.observe(issue.backendId, issue.auth);
-        // A login is shown at the next turn, not here: startup never waits on a person.
-        if (issue.auth?.recovery === "login") this.log(`${issue.backendId}: ${issue.code}: needs a sign-in`);
-        else this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}${issue.auth ? ` (${issue.auth.code})` : ""}`);
-      }
       this.hooks = hooks;
+      this.initialization(true);
       this.log(`delivering to ${registration.hooks.length} backend(s) from ${sources.map((source) => source.path).join(", ")}`);
     } catch (error) {
       this.hooks = undefined;
@@ -216,12 +221,28 @@ export class Adapter {
     return this.#queue;
   }
 
+  /** Configuration discovery's diagnostics not read yet. Hooks adds them as it
+   * retries a skipped backend (whose refusal no delivery would report), so they
+   * are read at startup, each turn and each /ahp. */
+  initialization(startup = false): void {
+    for (const issue of unseen(this.hooks?.initializationDiagnostics ?? [], this.#seen)) {
+      // Configuration discovery runs at the event endpoint.
+      this.logins?.observe(issue.backendId, issue.authError && issue.recovery ? { code: issue.authError, recovery: issue.recovery, ...(issue.requiredScopes ? { requiredScopes: issue.requiredScopes } : {}) } : undefined, "event");
+      // A login is shown at the next turn, not here: startup never waits on a person.
+      const line = `${issue.backendId}: ${issue.code}${issue.authError ? ` (${issue.authError})` : ""}`;
+      if (issue.recovery === "login") this.log(`${issue.backendId}: ${issue.code}: needs a sign-in`);
+      else if (startup) this.warn(`Agent Hooks Protocol: ${line}`);
+      else this.log(line);
+    }
+  }
+
   /** Delivery diagnostics, and the messages a backend has for a person. */
   report(result: AnyResult): void {
     // The adapter reads no attachment back: release what the SDK kept.
     void result.content?.close().catch(() => {});
     for (const diagnostic of result.diagnostics) {
-      this.logins?.observe(diagnostic.backendId, diagnostic.auth);
+      // Preparation fails at an upload endpoint; interception and observation at the event endpoint.
+      this.logins?.observe(diagnostic.backendId, diagnostic.auth, diagnostic.phase === "preparation" ? "upload" : "event");
       const line = `${diagnostic.backendId} ${diagnostic.phase}: ${diagnostic.code}${diagnostic.auth ? ` (${diagnostic.auth.code})` : ""}`;
       if (diagnostic.syntheticDenial) this.warn(`${line} (denied by failure policy)`);
       else this.log(line);
@@ -275,6 +296,7 @@ export class Adapter {
   }
 
   async close(): Promise<void> {
+    await this.logins?.close();
     await this.flush();
     const hooks = this.hooks;
     this.hooks = undefined;

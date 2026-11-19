@@ -198,3 +198,18 @@ test("secrets live in their own 0600 file, by reference", async () => {
   expect(await secrets.get("toString", signal())).toBeUndefined();
   expect(statSync(path).mode & 0o777).toBe(0o600);
 });
+
+test("expired pending logins an earlier version stored are dropped; live ones stay", async () => {
+  const path = join(root, "pending", "ahp-auth.json");
+  const pending = (state: string, expiresAt: number) => ({ kind: "pending_login", generation: state, state, expiresAt, verifier: "v" }) as unknown as StoredRecord;
+  const index = { kind: "pending_index", generation: "i", states: ["old", "new"] } as unknown as StoredRecord;
+  mkdirSync(join(root, "pending"), { recursive: true });
+  writeFileSync(path, JSON.stringify({ version: 1, records: { g: grant("1"), old: pending("old", Date.now() - 1000), new: pending("new", Date.now() + 60_000), index } }));
+  const store = new FileTokenStore(path);
+  await store.dropExpiredLogins(signal());
+  expect(Object.keys(JSON.parse(readFileSync(path, "utf8")).records).sort()).toEqual(["g", "index", "new"]);
+  // Once none is live, nothing of them is left.
+  writeFileSync(path, JSON.stringify({ version: 1, records: { g: grant("1"), new: pending("new", Date.now() - 1), index } }));
+  await store.dropExpiredLogins(signal());
+  expect(Object.keys(JSON.parse(readFileSync(path, "utf8")).records)).toEqual(["g"]);
+});
