@@ -1,5 +1,16 @@
 # Changelog
 
+## [0.4.0](https://github.com/agenthooksprotocol/adapter-pi/compare/v0.3.0...v0.4.0) (2026-11-19)
+
+
+### ⚠ BREAKING CHANGES
+
+* **oauth:** oauth.redirectPort is gone; a configured one is ignored with a warning. A Client ID Metadata Document should list http://127.0.0.1/callback (loopback redirects match without the port). Grants from earlier versions are not found, so users sign in again.
+
+### Bug Fixes
+
+* **oauth:** sign in per login on a loopback port, as MCP clients do ([#7](https://github.com/agenthooksprotocol/adapter-pi/issues/7)) ([eaef8e6](https://github.com/agenthooksprotocol/adapter-pi/commit/eaef8e64ccab217db9b16dbe4e3753d725d3563b))
+
 ## [0.3.0](https://github.com/agenthooksprotocol/adapter-pi/compare/v0.2.0...v0.3.0) (2026-11-18)
 
 
