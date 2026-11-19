@@ -288,22 +288,30 @@ test("bare /ahp login reports a refusal without adding that nothing needs a sign
   expect(said[0]).toContain("not allowed: root;");
 });
 
-// SDK 0.15.0 gap: discovery refuses a step-up beyond the ceiling with a bare
-// access_denied, without requiredScopes, so the scopes never reach observe. This
-// asserts once the SDK attaches them.
-test.todo("the SDK's own refusal of a step-up beyond the ceiling names the scopes", async () => {
+test("the SDK's own refusal of a step-up beyond the allowed scopes names them", async () => {
   const { as, host, logins } = setup(["hooks"]);
   await signIn(as, host, logins);
-  const response = new Response(null, { status: 403, headers: { "www-authenticate": 'Bearer error="insufficient_scope", scope="root"' } });
-  const error = await Promise.resolve(logins.provider.challenge({ backendId: ID, purpose: "event", url: `${ISSUER}/ahp`, response, credential: undefined })).then(
-    () => undefined,
-    (thrown: unknown) => thrown,
-  );
-  expect(error).toBeInstanceOf(AuthError);
-  const { code, recovery, requiredScopes } = error as AuthError;
-  logins.observe(ID, { code, recovery, ...(requiredScopes ? { requiredScopes } : {}) });
+  // A delivery answered 403 insufficient_scope for a scope oauth.scopes lacks.
+  const refuse = async () => {
+    const response = new Response(null, { status: 403, headers: { "www-authenticate": 'Bearer error="insufficient_scope", scope="root"' } });
+    const error = await Promise.resolve(logins.provider.challenge({ backendId: ID, purpose: "event", url: `${ISSUER}/ahp`, response, credential: undefined })).then(
+      () => undefined,
+      (thrown: unknown) => thrown,
+    );
+    expect(error).toBeInstanceOf(AuthError);
+    const { code, recovery, requiredScopes } = error as AuthError;
+    expect(code).toBe("access_denied");
+    expect(requiredScopes).toEqual(["root"]);
+    logins.observe(ID, { code, recovery, ...(requiredScopes ? { requiredScopes } : {}) });
+  };
+  await refuse();
   await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
   expect(host.notes.at(-1)).toContain("not allowed: root;");
+  await refuse();
+  await logins.command(`login ${ID}`);
+  expect(host.notes.at(-1)).toContain("not allowed: root;");
+  expect(host.notes.at(-1)).not.toContain("already signed in");
 });
 
 test("a refusal naming only allowed scopes names none", async () => {
