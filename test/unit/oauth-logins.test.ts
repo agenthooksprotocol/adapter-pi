@@ -582,3 +582,14 @@ test("a sign-in granted fewer scopes than its step-up says so, not to try again"
   expect(host.notes.at(-1)).toBe(`Sign-in to ${ID} failed: access_denied (the issuer did not grant admin).`);
   await logins.close();
 });
+
+test("a retryable delivery failure is not kept; one a setting must fix is", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  await signIn(as, host, logins);
+  logins.observe(ID, { code: "provider_failed", recovery: "retry" });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+  logins.observe(ID, { code: "untrusted_destination", recovery: "configure" });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain("last delivery: untrusted_destination");
+});

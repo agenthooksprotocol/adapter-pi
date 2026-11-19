@@ -236,7 +236,10 @@ export class Logins {
       this.#deliveryFailures.delete(backendId);
     } else {
       // A scoped access_denied is a refusal (or the issuer granting fewer), kept below.
-      if (!(failure.code === "access_denied" && failure.requiredScopes?.length)) this.#deliveryFailures.set(backendId, failure.code);
+      // A retryable one (a token endpoint's 503, say) is logged only: no later
+      // success would clear it.
+      if (failure.recovery === "retry") this.host.log(`${backendId}: delivery failed: ${failure.code}; will retry`);
+      else if (!(failure.code === "access_denied" && failure.requiredScopes?.length)) this.#deliveryFailures.set(backendId, failure.code);
       // The SDK refuses a step-up beyond the ceiling itself, naming the scopes. One
       // naming none is something else, and leaves a recorded refusal as it was.
       if (failure.code === "access_denied" && failure.requiredScopes?.length) {
