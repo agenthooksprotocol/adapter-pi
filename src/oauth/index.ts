@@ -235,12 +235,15 @@ export class Logins {
       this.#needed.set(backendId, scopes.length ? scopes : undefined);
       this.#deliveryFailures.delete(backendId);
     } else {
-      this.#deliveryFailures.set(backendId, failure.code);
+      // A scoped access_denied is a refusal (or the issuer granting fewer), kept below.
+      if (!(failure.code === "access_denied" && failure.requiredScopes?.length)) this.#deliveryFailures.set(backendId, failure.code);
       // The SDK refuses a step-up beyond the ceiling itself, naming the scopes. One
       // naming none is something else, and leaves a recorded refusal as it was.
       if (failure.code === "access_denied" && failure.requiredScopes?.length) {
         const backend = this.#backends.get(backendId)!;
-        const refusal = this.#judge(backend, failure.requiredScopes, purpose && backend.endpoints.find((endpoint) => endpoint.purpose === purpose));
+        // Several endpoints of that purpose: which one refused is unknown.
+        const candidates = backend.endpoints.filter((endpoint) => endpoint.purpose === purpose);
+        const refusal = this.#judge(backend, failure.requiredScopes, candidates.length === 1 ? candidates[0] : undefined);
         if (refusal.unclear.length) this.host.log(`${backendId}: refused ${refusal.unclear.join(" ")}, which an endpoint allows: the issuer may have granted fewer`);
         if (refusal.outside.length || refusal.partial.length) this.#refusals.set(backendId, refusal);
       }
@@ -312,7 +315,8 @@ export class Logins {
       const result = await backend.oauth.prepare(context, budget(PREPARE_BUDGET_MS), { redirectUri: receiver.redirectUri, ...(requiredScopes ? { requiredScopes } : {}) });
       if (result.type === "ready") {
         receiver.close();
-        this.#done(backend.id, requiredScopes ?? []);
+        // Ready is not a sign-in: what deliveries reported still stands.
+        this.#done(backend.id, requiredScopes ?? [], false);
         return "ready";
       }
       receiver.state = result.state;
@@ -333,7 +337,9 @@ export class Logins {
         this.#prepareRefusals.set(backend.id, refusal);
         if (refusal.outside.length || refusal.partial.length) this.#refusals.set(backend.id, refusal);
       }
-      this.#needed.delete(backend.id);
+      // A transient failure keeps the scopes deliveries asked for, for the next try.
+      const retryable = failure === "timeout" || (error instanceof AuthError && error.recovery === "retry");
+      if (!retryable) this.#needed.delete(backend.id);
       this.#prepareFailures.set(backend.id, failure);
       return failure;
     }
@@ -372,7 +378,12 @@ export class Logins {
     } catch (error) {
       const failure = code(error);
       const active = this.#active.get(backend.id);
-      if (active && stateOf(callback) === active.login.state) {
+      const state = stateOf(callback);
+      if (active && state !== null && state !== active.login.state && !active.ended) {
+        this.host.notify(`That address is from another sign-in to ${backend.id}; this one is still waiting.`, "warning");
+        return { ok: false, message: `This address is from another sign-in to ${backend.id}. The current sign-in is still waiting in pi.` };
+      }
+      if (active && state === active.login.state) {
         // A callback the SDK refused before using it (a wrong address, issuer or a
         // stray request) leaves the login waiting for the real one.
         if (await this.#live(backend, active)) {
@@ -382,6 +393,12 @@ export class Logins {
         }
         // A login the SDK used up has ended; the next turn or /ahp login makes another.
         await this.#end(backend, active);
+      }
+      // Fewer scopes granted than the login asked for: trying again changes nothing.
+      if (error instanceof AuthError && error.code === "access_denied" && error.requiredScopes?.length) {
+        const why = hint(failure, this.#judge(backend, error.requiredScopes, backend.endpoints[0]), "prepare");
+        this.host.notify(`Sign-in to ${backend.id} failed: ${failure}${why}.`, "warning");
+        return { ok: false, message: `Sign-in to ${backend.id} failed: ${failure}${why}.` };
       }
       this.host.notify(`Sign-in to ${backend.id} failed: ${failure}.`, "warning");
       return { ok: false, message: `Sign-in to ${backend.id} failed (${failure}). Run /ahp login ${backend.id} in pi to try again.` };
@@ -422,7 +439,7 @@ export class Logins {
 
   /** A grant now covers `covered` (everything, when signing out): the scopes
    * still needed beyond it wait for the next login. */
-  #done(id: string, covered?: readonly string[]): void {
+  #done(id: string, covered?: readonly string[], signedIn = true): void {
     const needed = this.#needed.get(id);
     const remaining = covered && needed ? needed.filter((scope) => !covered.includes(scope)) : [];
     if (remaining.length) this.#needed.set(id, remaining);
@@ -430,7 +447,7 @@ export class Logins {
       this.#needed.delete(id);
       this.#told.delete(id);
     }
-    this.#deliveryFailures.delete(id);
+    if (signedIn) this.#deliveryFailures.delete(id);
     this.#prepareFailures.delete(id);
     const active = this.#active.get(id);
     if (!active) return;
@@ -489,12 +506,15 @@ export class Logins {
     const refusal = this.#refusal(backend.id);
     if (result === "ready") {
       const flow = backend.settings.flow ?? backend.preset?.flow;
-      return `${flow === "client_credentials" ? "client-credentials" : "authorized"}${refusal ? `; last refused${hint("access_denied", refusal, "delivery")}` : ""}`;
+      const refused = refusal ? `; last refused${hint("access_denied", refusal, "delivery")}` : "";
+      const failed = delivery ? `; last delivery: ${delivery}${hint(delivery, undefined, "delivery")}` : "";
+      return `${flow === "client_credentials" ? "client-credentials" : "authorized"}${refused}${failed}`;
     }
     if (typeof result === "string") {
       const own = `failing: ${result}${hint(result, this.#prepareRefusals.get(backend.id), "prepare")}`;
       // A delivery failing the same way is this failure again, already explained.
-      return delivery && delivery !== result ? `${own}; last delivery: ${delivery}${hint(delivery, refusal, "delivery")}` : own;
+      const failed = delivery && delivery !== result ? `; last delivery: ${delivery}${hint(delivery, undefined, "delivery")}` : "";
+      return `${own}${failed}${refusal ? `; last refused${hint("access_denied", refusal, "delivery")}` : ""}`;
     }
     return `needs-login: ${result.login.authorizationUrl}`;
   }

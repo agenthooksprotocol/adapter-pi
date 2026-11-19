@@ -503,3 +503,82 @@ test("a delivery's upload refusal is judged at the upload endpoint", async () =>
   expect(host.notes.at(-1)).toContain(`${ID}: authorized; last refused`);
   expect(host.notes.at(-1)).toContain("not allowed on every endpoint: hooks");
 });
+
+test("a delivery failure a sign-in does not fix stays in the status", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  await signIn(as, host, logins);
+  // An upload endpoint on a private address: every preparation fails.
+  logins.observe(ID, { code: "untrusted_destination", recovery: "configure" }, "upload");
+  for (let i = 0; i < 2; i++) {
+    await logins.command(`status ${ID}`);
+    expect(host.notes.at(-1)).toBe(`${ID}: authorized; last delivery: untrusted_destination (a private address: set oauth.allowPrivateNetwork in hooks.json)`);
+  }
+  // A completed sign-in clears it.
+  await logins.command(`logout ${ID}`);
+  await signIn(as, host, logins);
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+});
+
+test("a preparation refusal among several upload endpoints is judged at an unknown endpoint", async () => {
+  const auth = (resource: string, scopes: string[]) => ({ type: "oauth", flow: "authorization_code_pkce", issuer: ISSUER, resource, clientId: "pi", scopes });
+  const upload = (path: string, scopes: string[]) => ({ endpoint: `${ISSUER}${path}`, timeoutMs: 1000, maxBytes: 1000, auth: auth(`${ISSUER}${path}`, scopes) });
+  const { as, host, logins } = setup(undefined, {
+    oauth: {},
+    authentication: auth(`${ISSUER}/ahp`, ["hooks"]),
+    subscriptions: [
+      { mode: "observe", events: ["a.*"], content: { default: "body" }, upload: upload("/a", ["a"]) },
+      { mode: "observe", events: ["b.*"], content: { default: "body" }, upload: upload("/b", ["b"]) },
+    ],
+  });
+  await signIn(as, host, logins);
+  // /a allows a, /b does not: which upload refused it is not known.
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["a"] }, "upload");
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain("not allowed on every endpoint: a");
+});
+
+test("a transient sign-in failure keeps the step-up's scopes", async () => {
+  const { as, host, logins } = setup();
+  logins.observe(ID, { ...login, requiredScopes: ["admin"] });
+  as.state.down = true;
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toStartWith(`${ID}: failing: discovery_failed`);
+  as.state.down = false;
+  logins.turnStart();
+  await until(() => host.link(), "the step-up link");
+  // The login still asks for admin: a grant without it does not complete it.
+  as.state.granted = "hooks";
+  expect((await fetch(as.consent(host.link()!))).status).toBe(400);
+  await logins.close();
+});
+
+test("an address from another sign-in leaves this one waiting", async () => {
+  const { as, host, logins } = setup();
+  const done = logins.command(`login ${ID}`);
+  await until(() => host.prompts.length === 1, "the paste box");
+  const link = host.link()!;
+  // This sign-in's address, with an older sign-in's state.
+  host.prompts[0]!(`${redirectOf(link)}?code=x&state=older&iss=${encodeURIComponent(ISSUER)}`);
+  await until(() => host.prompts.length === 2, "the paste box again");
+  expect(host.notes.at(-1)).toBe(`That address is from another sign-in to ${ID}; this one is still waiting.`);
+  expect(host.link()).toBe(link);
+  host.prompts[1]!(as.consent(link));
+  await done;
+  expect(host.notes.at(-1)).toBe(`Signed in to ${ID}.`);
+});
+
+test("a sign-in granted fewer scopes than its step-up says so, not to try again", async () => {
+  const { as, host, logins } = setup();
+  logins.observe(ID, { ...login, requiredScopes: ["admin"] });
+  logins.turnStart();
+  await until(() => host.link(), "the step-up link");
+  as.state.granted = "hooks";
+  const page = await fetch(as.consent(host.link()!));
+  expect(page.status).toBe(400);
+  const text = await page.text();
+  expect(text).toContain("the issuer did not grant admin");
+  expect(text).not.toContain("try again");
+  expect(host.notes.at(-1)).toBe(`Sign-in to ${ID} failed: access_denied (the issuer did not grant admin).`);
+  await logins.close();
+});
