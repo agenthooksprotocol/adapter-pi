@@ -27,7 +27,7 @@ test("each sign-in listens on a port of its own, for its own login's redirect on
   expect(seen).toHaveLength(1);
 });
 
-test("one callback per login: a repeat is answered neutrally, not as a failure", async () => {
+test("one callback per login: a repeat gets the first one's answer, not a failure", async () => {
   let calls = 0;
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));
@@ -40,13 +40,15 @@ test("one callback per login: a repeat is answered neutrally, not as a failure",
   const first = fetch(`${receiver.redirectUri}?code=c&state=A`);
   await Bun.sleep(50);
   // A second request while the first is handled, and another after it.
-  const during = await fetch(`${receiver.redirectUri}?code=c&state=A`);
+  const pending = fetch(`${receiver.redirectUri}?code=c&state=A`);
+  await Bun.sleep(50);
   release();
   expect((await first).status).toBe(200);
+  const during = await pending;
   const after = await fetch(`${receiver.redirectUri}?code=c&state=A`);
   for (const repeat of [during, after]) {
     expect(repeat.status).toBe(200);
-    expect(await repeat.text()).toContain("already received");
+    expect(await repeat.text()).toContain("Signed in to a.");
   }
   expect(calls).toBe(1);
   // A handler that leaves the login waiting takes the next one.

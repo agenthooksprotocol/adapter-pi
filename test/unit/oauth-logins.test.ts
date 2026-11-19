@@ -196,7 +196,57 @@ test("/ahp login returns when its login ended before it began to wait", async ()
   expect(finished).toBe(true);
 });
 
-test("a step-up beyond the allowed scopes says so, not that the issuer is untrusted", async () => {
+/** Sign in through /ahp login and a pasted redirect. */
+async function signIn(as: ReturnType<typeof server>, host: Host, logins: Logins): Promise<void> {
+  const done = logins.command(`login ${ID}`);
+  await until(() => host.prompts.length, "the paste box");
+  host.prompts.shift()!(as.consent(host.link()!));
+  await done;
+  expect(host.notes.at(-1)).toBe(`Signed in to ${ID}.`);
+}
+
+test("completing an older login keeps the step-up scopes it did not cover", async () => {
+  const { as, host, logins } = setup();
+  logins.observe(ID, login);
+  logins.turnStart();
+  await until(() => host.link(), "the first link");
+  // A step-up arrives while the first link shows; the person then finishes it.
+  logins.observe(ID, { ...login, requiredScopes: ["admin"] });
+  as.state.granted = "hooks";
+  expect((await fetch(as.consent(host.link()!))).status).toBe(200);
+  expect(host.link()).toBeUndefined();
+  // admin is still needed: the next turn shows a login for it.
+  logins.turnStart();
+  await until(() => host.link(), "a link for the step-up");
+  await logins.close();
+});
+
+test("a step-up the SDK refuses beyond the allowed scopes says so, even when signed in", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  await signIn(as, host, logins);
+  // What the SDK's challenge gives for 403 insufficient_scope scope="hooks root".
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["hooks", "root"] });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
+  // Only the scope outside oauth.scopes is named.
+  expect(host.notes.at(-1)).toContain("not allowed: root;");
+  await logins.command(`login ${ID}`);
+  expect(host.notes.at(-1)).toContain("not allowed: root;");
+  expect(host.notes.at(-1)).not.toContain("already signed in");
+  expect(host.notes.at(-1)).not.toContain("not trusted");
+});
+
+test("a refusal naming only allowed scopes names none", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  await signIn(as, host, logins);
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["hooks"] });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+  await logins.command(`login ${ID}`);
+  expect(host.notes.at(-1)).toContain("already signed in");
+});
+
+test("a login asked for scopes beyond the allowed ones says so, not that the issuer is untrusted", async () => {
   const { host, logins } = setup(["hooks"]);
   logins.observe(ID, { ...login, requiredScopes: ["root"] });
   await logins.command(`login ${ID}`);

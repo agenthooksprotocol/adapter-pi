@@ -29,8 +29,8 @@ export async function receive(handler: CallbackHandler): Promise<Receiver> {
   let receiver: Receiver;
   let answering = 0;
   let closed = false;
-  /** States already handled here: a repeat gets a neutral page, not a failure. */
-  const handled = new Set<string>();
+  /** Each handled state's answer: a repeat gets the same one, once it is known. */
+  const handled = new Map<string, Promise<{ status: number; body: string }>>();
   const server = createServer((request, response) => {
     answering++;
     void (async () => {
@@ -41,13 +41,15 @@ export async function receive(handler: CallbackHandler): Promise<Receiver> {
         answer = page(400, "This sign-in is not one this pi is waiting for. Start it again with /ahp login.");
         if (receiver.state !== undefined && state === receiver.state) {
           // One callback per login: a browser's repeat (a reload, a double redirect)
-          // must not report a failure beside the sign-in.
+          // gets the first one's answer, never a failure beside the sign-in.
           receiver.state = undefined;
-          handled.add(state);
-          const result = await handler(url.href).catch(() => ({ ok: false, message: "Sign-in failed." }));
-          answer = page(result.ok ? 200 : 400, result.message);
+          const first = handler(url.href)
+            .catch(() => ({ ok: false, message: "Sign-in failed." }))
+            .then((result) => page(result.ok ? 200 : 400, result.message));
+          handled.set(state, first);
+          answer = await first;
         } else if (handled.has(state)) {
-          answer = page(200, "This sign-in was already received. You can close this tab.");
+          answer = await handled.get(state)!;
         }
       }
       response.writeHead(answer.status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });

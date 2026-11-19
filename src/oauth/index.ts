@@ -202,7 +202,20 @@ export class Logins {
       this.#failing.delete(backendId);
     } else {
       this.#failing.set(backendId, failure.code);
+      // The SDK refuses a step-up beyond the ceiling itself, naming the scopes.
+      if (failure.code === "access_denied" && failure.requiredScopes?.length) this.#refused(backendId, failure.requiredScopes);
     }
+  }
+
+  /** Scopes the backend may not have: required ones outside its configured scopes.
+   * Fewer granted than asked for is the issuer's choice, not this. */
+  #refused(id: string, required: readonly string[]): void {
+    const backend = this.#backends.get(id)!;
+    const preset = backend.preset?.type === "oauth" ? (backend.preset as Record<string, unknown>) : undefined;
+    const ceiling = backend.settings.scopes ?? (Array.isArray(preset?.scopes) ? (preset.scopes as string[]) : []);
+    const outside = required.filter((scope) => !ceiling.includes(scope));
+    if (outside.length) this.#outside.set(id, outside);
+    else this.#outside.delete(id);
   }
 
   /** A turn starts: prepare, in the background, each login a delivery asked for,
@@ -244,7 +257,6 @@ export class Logins {
     const endpoint = backend.endpoints[0];
     if (!endpoint) return "unsupported_binding";
     const requiredScopes = this.#needed.get(backend.id);
-    this.#outside.delete(backend.id);
     let receiver: Receiver | undefined;
     try {
       receiver = await receive((callback) => this.#complete(backend, callback));
@@ -252,7 +264,7 @@ export class Logins {
       const result = await backend.oauth.prepare(context, budget(PREPARE_BUDGET_MS), { redirectUri: receiver.redirectUri, ...(requiredScopes ? { requiredScopes } : {}) });
       if (result.type === "ready") {
         receiver.close();
-        this.#done(backend.id);
+        this.#done(backend.id, requiredScopes ?? []);
         return "ready";
       }
       receiver.state = result.state;
@@ -267,7 +279,7 @@ export class Logins {
       receiver?.close();
       const failure = code(error);
       // Step-up scopes beyond the ceiling fail access_denied, naming them.
-      if (error instanceof AuthError && error.code === "access_denied" && error.requiredScopes?.length) this.#outside.set(backend.id, error.requiredScopes);
+      if (error instanceof AuthError && error.code === "access_denied") this.#refused(backend.id, error.requiredScopes ?? []);
       this.#needed.delete(backend.id);
       this.#failing.set(backend.id, failure);
       return failure;
@@ -298,8 +310,10 @@ export class Logins {
   /** A redirect reached this login's listener, or was pasted into this pi. */
   async #complete(backend: Backend, callback: string): Promise<{ ok: boolean; message: string }> {
     try {
+      const active = this.#active.get(backend.id);
+      const completed = active && stateOf(callback) === active.login.state ? active.required : [];
       await backend.oauth.complete(callback, budget(PREPARE_BUDGET_MS));
-      this.#done(backend.id);
+      this.#done(backend.id, completed);
       this.host.notify(`Signed in to ${backend.id}.`);
       return { ok: true, message: `Signed in to ${backend.id}. You can close this tab.` };
     } catch (error) {
@@ -353,10 +367,17 @@ export class Logins {
     for (const settle of active.waiters.splice(0)) settle();
   }
 
-  #done(id: string): void {
-    this.#needed.delete(id);
+  /** A grant now covers `covered` (everything, when signing out): the scopes
+   * still needed beyond it wait for the next login. */
+  #done(id: string, covered?: readonly string[]): void {
+    const needed = this.#needed.get(id);
+    const remaining = covered && needed ? needed.filter((scope) => !covered.includes(scope)) : [];
+    if (remaining.length) this.#needed.set(id, remaining);
+    else {
+      this.#needed.delete(id);
+      this.#told.delete(id);
+    }
     this.#failing.delete(id);
-    this.#told.delete(id);
     const active = this.#active.get(id);
     if (!active) return;
     this.#active.delete(id);
@@ -411,11 +432,12 @@ export class Logins {
     if (!(await this.#relevant(backend))) return "no sign-in needed";
     const failing = this.#failing.get(backend.id);
     const result = await this.#ensure(backend);
+    const outside = this.#outside.get(backend.id);
     if (result === "ready") {
       const flow = backend.settings.flow ?? backend.preset?.flow;
-      return flow === "client_credentials" ? "client-credentials" : "authorized";
+      return `${flow === "client_credentials" ? "client-credentials" : "authorized"}${outside ? `, but refused${hint("access_denied", outside)}` : ""}`;
     }
-    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result, this.#outside.get(backend.id))}`;
+    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result, outside)}`;
     return `needs-login: ${result.login.authorizationUrl}`;
   }
 
@@ -429,12 +451,17 @@ export class Logins {
         continue;
       }
       const result = await this.#ensure(backend);
+      const outside = this.#outside.get(backend.id);
+      if (result === "ready" && outside) {
+        this.host.notify(`${backend.id} is signed in, but a sign-in cannot fix what it was refused${hint("access_denied", outside)}`, "warning");
+        continue;
+      }
       if (result === "ready") {
         if (target) this.host.notify(`${backend.id} is already signed in. /ahp logout ${backend.id} first to sign in as someone else.`);
         continue;
       }
       if (typeof result === "string") {
-        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result, this.#outside.get(backend.id))}`, "warning");
+        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result, outside)}`, "warning");
         continue;
       }
       walked++;
@@ -500,6 +527,7 @@ export class Logins {
       });
     }
     this.#done(id);
+    this.#outside.delete(id);
     this.host.notify(`Signed out of ${id}.`);
   }
 }
