@@ -151,7 +151,7 @@ export class Adapter {
         source: SOURCE,
         harness: { name: "pi", version: VERSION },
         capabilities: this.ctx.hasUI ? capabilities : withoutUI,
-        ...(this.logins ? { auth: this.logins.provider } : {}),
+        ...(this.logins ? { auth: this.logins.provider, fetch: this.logins.fetch } : {}),
         manifestMetadata: {
           authentication: ["bearer", "oauth"],
           contentCategories,
@@ -226,7 +226,8 @@ export class Adapter {
    * are read at startup, each turn and each /ahp. */
   initialization(startup = false): void {
     for (const issue of unseen(this.hooks?.initializationDiagnostics ?? [], this.#seen)) {
-      this.logins?.observe(issue.backendId, issue.authError && issue.recovery ? { code: issue.authError, recovery: issue.recovery, ...(issue.requiredScopes ? { requiredScopes: issue.requiredScopes } : {}) } : undefined);
+      // Configuration discovery runs at the event endpoint.
+      this.logins?.observe(issue.backendId, issue.authError && issue.recovery ? { code: issue.authError, recovery: issue.recovery, ...(issue.requiredScopes ? { requiredScopes: issue.requiredScopes } : {}) } : undefined, "event");
       // A login is shown at the next turn, not here: startup never waits on a person.
       const line = `${issue.backendId}: ${issue.code}${issue.authError ? ` (${issue.authError})` : ""}`;
       if (issue.recovery === "login") this.log(`${issue.backendId}: ${issue.code}: needs a sign-in`);

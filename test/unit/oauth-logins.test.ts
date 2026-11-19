@@ -232,7 +232,7 @@ test("a step-up the SDK refuses beyond the allowed scopes says so, even when sig
   // What the SDK's challenge gives for 403 insufficient_scope scope="hooks root".
   logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["hooks", "root"] });
   await logins.command(`status ${ID}`);
-  expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
+  expect(host.notes.at(-1)).toContain(`${ID}: authorized; last refused`);
   // Only the scope outside oauth.scopes is named.
   expect(host.notes.at(-1)).toContain("not allowed: root;");
   // Refused again: still named.
@@ -245,22 +245,64 @@ test("a step-up the SDK refuses beyond the allowed scopes says so, even when sig
 
 const refused = { code: "access_denied", recovery: "none", requiredScopes: ["root"] } as const;
 
-test("a refusal stays until an access_denied names no scopes, or a sign-out", async () => {
+test("a refusal stays through an unrelated access_denied, until a sign-out", async () => {
   const { as, host, logins } = setup(["hooks"]);
   await signIn(as, host, logins);
   logins.observe(ID, refused);
+  // Another 403, not about scopes: says nothing of the refusal.
+  logins.observe(ID, { code: "access_denied", recovery: "none" });
   for (let i = 0; i < 2; i++) {
     await logins.command(`status ${ID}`);
     expect(host.notes.at(-1)).toContain("not allowed: root;");
   }
-  logins.observe(ID, { code: "access_denied", recovery: "none" });
-  await logins.command(`status ${ID}`);
-  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
-  logins.observe(ID, refused);
   await logins.command(`logout ${ID}`);
   await signIn(as, host, logins);
   await logins.command(`status ${ID}`);
   expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+});
+
+/** A protected resource that answers `status` to whatever is sent. */
+function resource(status: number) {
+  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response(null, { status }) });
+  return { url: `http://127.0.0.1:${server.port}/ahp`, stop: () => server.stop(true) };
+}
+
+/** A delivery as Hooks makes it: the provider's credential, sent through the logins' fetch. */
+async function deliver(logins: Logins, url: string): Promise<number> {
+  const credential = await logins.provider.credential({ backendId: ID, purpose: "event", url: `${ISSUER}/ahp` });
+  expect(credential).toBeDefined();
+  const headers = new Headers({ authorization: `Bearer ${credential!.token}` });
+  return (await logins.fetch(url, { method: "POST", headers, body: "{}" })).status;
+}
+
+test("a delivery the backend accepts ends what it last refused; one it refuses does not", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  await signIn(as, host, logins);
+  logins.observe(ID, refused);
+  const forbidden = resource(403);
+  const accepted = resource(202);
+  try {
+    expect(await deliver(logins, forbidden.url)).toBe(403);
+    await logins.command(`status ${ID}`);
+    expect(host.notes.at(-1)).toContain(`${ID}: authorized; last refused`);
+    expect(await deliver(logins, accepted.url)).toBe(202);
+    await logins.command(`status ${ID}`);
+    expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+  } finally {
+    forbidden.stop();
+    accepted.stop();
+  }
+});
+
+test("a delivery's own 403 is the backend refusing, not an untrusted issuer", async () => {
+  // No client for a sign-in: prepare fails credential_unavailable.
+  const { host, logins } = setup(["hooks"], { oauth: { issuer: ISSUER, scopes: ["hooks"] } });
+  logins.observe(ID, { code: "access_denied", recovery: "none" });
+  await logins.command(`status ${ID}`);
+  const note = host.notes.at(-1)!;
+  expect(note).toContain("failing: credential_unavailable (no client");
+  expect(note).toContain("last delivery: access_denied (the backend refused access)");
+  expect(note).not.toContain("not trusted");
 });
 
 test("a sign-in does not lift a refusal: a backend refused at startup stays reported", async () => {
@@ -271,7 +313,7 @@ test("a sign-in does not lift a refusal: a backend refused at startup stays repo
   await signIn(as, host, logins);
   for (let i = 0; i < 2; i++) {
     await logins.command(`status ${ID}`);
-    expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
+    expect(host.notes.at(-1)).toContain(`${ID}: authorized; last refused`);
     expect(host.notes.at(-1)).toContain("not allowed: root;");
   }
 });
@@ -318,7 +360,7 @@ test("the SDK's own refusal of a step-up beyond the allowed scopes names them", 
   };
   await refuse();
   await logins.command(`status ${ID}`);
-  expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
+  expect(host.notes.at(-1)).toContain(`${ID}: authorized; last refused`);
   expect(host.notes.at(-1)).toContain("not allowed: root;");
   await refuse();
   await logins.command(`login ${ID}`);
@@ -365,7 +407,7 @@ test("a scope one endpoint allows and another does not is reported as such", asy
   expect(error.requiredScopes).toEqual(["uploads"]);
   logins.observe(ID, { code: error.code, recovery: error.recovery, requiredScopes: error.requiredScopes! });
   await logins.command(`status ${ID}`);
-  expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
+  expect(host.notes.at(-1)).toContain(`${ID}: authorized; last refused`);
   expect(host.notes.at(-1)).toContain("not allowed on every endpoint: uploads; set oauth.scopes");
 });
 
@@ -415,4 +457,25 @@ test("a configuration refusal Hooks records after startup reaches the logins", a
   adapter.initialization();
   await logins.command(`status ${ID}`);
   expect(host.notes.at(-1)).toContain("not allowed: root;");
+});
+
+test("a scope the event endpoint allows, refused somewhere unnamed, is not reported as a refusal", async () => {
+  const { as, host, logins } = setup(undefined, split);
+  await signIn(as, host, logins);
+  // hooks is allowed at the event endpoint: this may be the issuer granting fewer.
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["hooks"] });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+  // Configuration discovery names its endpoint: uploads is refused at the event endpoint.
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["uploads"] }, "event");
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain("not allowed on every endpoint: uploads");
+});
+
+test("an upload refused a scope its endpoint allows is the issuer granting fewer", async () => {
+  const { as, host, logins } = setup(undefined, split);
+  await signIn(as, host, logins);
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["uploads"] }, "upload");
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
 });
