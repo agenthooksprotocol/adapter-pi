@@ -5,6 +5,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AuthError } from "agenthooksprotocol/client";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { Hooks } from "agenthooksprotocol/client";
+import { Adapter, unseen } from "../../src/adapter.ts";
 import { Logins, type LoginHost } from "../../src/oauth/index.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ahp-pi-logins-"));
@@ -232,7 +235,7 @@ test("a step-up the SDK refuses beyond the allowed scopes says so, even when sig
   expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
   // Only the scope outside oauth.scopes is named.
   expect(host.notes.at(-1)).toContain("not allowed: root;");
-  // The status found the grant ready, which clears it; the next refusal sets it again.
+  // Refused again: still named.
   logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["root"] });
   await logins.command(`login ${ID}`);
   expect(host.notes.at(-1)).toContain("not allowed: root;");
@@ -242,26 +245,35 @@ test("a step-up the SDK refuses beyond the allowed scopes says so, even when sig
 
 const refused = { code: "access_denied", recovery: "none", requiredScopes: ["root"] } as const;
 
-test("a refusal is forgotten once a grant is found ready, or an access_denied names no scopes", async () => {
+test("a refusal stays until an access_denied names no scopes, or a sign-out", async () => {
   const { as, host, logins } = setup(["hooks"]);
   await signIn(as, host, logins);
   logins.observe(ID, refused);
-  await logins.command(`status ${ID}`);
-  expect(host.notes.at(-1)).toContain("not allowed: root;");
+  for (let i = 0; i < 2; i++) {
+    await logins.command(`status ${ID}`);
+    expect(host.notes.at(-1)).toContain("not allowed: root;");
+  }
+  logins.observe(ID, { code: "access_denied", recovery: "none" });
   await logins.command(`status ${ID}`);
   expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
   logins.observe(ID, refused);
-  logins.observe(ID, { code: "access_denied", recovery: "none" });
+  await logins.command(`logout ${ID}`);
+  await signIn(as, host, logins);
   await logins.command(`status ${ID}`);
   expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
 });
 
-test("a completed sign-in forgets a refusal", async () => {
+test("a sign-in does not lift a refusal: a backend refused at startup stays reported", async () => {
   const { as, host, logins } = setup(["hooks"]);
+  // Configuration discovery refused root at startup; the backend has no routes,
+  // so no delivery will report it again.
   logins.observe(ID, refused);
   await signIn(as, host, logins);
-  await logins.command(`status ${ID}`);
-  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+  for (let i = 0; i < 2; i++) {
+    await logins.command(`status ${ID}`);
+    expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
+    expect(host.notes.at(-1)).toContain("not allowed: root;");
+  }
 });
 
 test("the allowed scopes are every endpoint's when oauth.scopes is not set", async () => {
@@ -331,4 +343,76 @@ test("a login asked for scopes beyond the allowed ones says so, not that the iss
   const note = host.notes.find((text) => text.startsWith(`${ID} cannot sign in: access_denied`));
   expect(note).toContain("not allowed: root");
   expect(note).not.toContain("not trusted");
+});
+
+/** Event endpoint allowed hooks, upload endpoint allowed uploads; no oauth.scopes. */
+const split = {
+  oauth: {},
+  authentication: { type: "oauth", flow: "authorization_code_pkce", issuer: ISSUER, resource: `${ISSUER}/ahp`, clientId: "pi", scopes: ["hooks"] },
+  subscriptions: [{ mode: "observe", events: ["*"], content: { default: "body" }, upload: { endpoint: `${ISSUER}/content`, timeoutMs: 1000, maxBytes: 1000, auth: { type: "oauth", flow: "authorization_code_pkce", issuer: ISSUER, resource: `${ISSUER}/content`, clientId: "pi", scopes: ["uploads"] } } }],
+};
+
+test("a scope one endpoint allows and another does not is reported as such", async () => {
+  const { as, host, logins } = setup(undefined, split);
+  await signIn(as, host, logins);
+  // The SDK checks the event endpoint's own scopes: uploads is refused there.
+  const response = new Response(null, { status: 403, headers: { "www-authenticate": 'Bearer error="insufficient_scope", scope="uploads"' } });
+  const error = (await Promise.resolve(logins.provider.challenge({ backendId: ID, purpose: "event", url: `${ISSUER}/ahp`, authentication: split.authentication as never, response, credential: undefined })).then(
+    () => undefined,
+    (thrown: unknown) => thrown,
+  )) as AuthError;
+  expect(error.code).toBe("access_denied");
+  expect(error.requiredScopes).toEqual(["uploads"]);
+  logins.observe(ID, { code: error.code, recovery: error.recovery, requiredScopes: error.requiredScopes! });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
+  expect(host.notes.at(-1)).toContain("not allowed on every endpoint: uploads; set oauth.scopes");
+});
+
+test("a login refused for scopes names them, never an untrusted issuer", async () => {
+  const { host, logins } = setup(undefined, split);
+  // A step-up for uploads: the sign-in, made for the event endpoint, may not ask for it.
+  logins.observe(ID, { ...login, requiredScopes: ["uploads"] });
+  await logins.command(`login ${ID}`);
+  const note = host.notes.find((text) => text.startsWith(`${ID} cannot sign in: access_denied`));
+  expect(note).toContain("not allowed on every endpoint: uploads");
+  expect(note).not.toContain("not trusted");
+});
+
+test("an issuer granting fewer scopes than allowed is not a refusal", async () => {
+  const { as, host, logins } = setup(["hooks", "admin"]);
+  await signIn(as, host, logins);
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["admin"] });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+});
+
+test("initialization diagnostics are read once each, though Hooks drops old ones", () => {
+  const seen = new WeakSet<object>();
+  const list = [{ backendId: "a" }, { backendId: "b" }];
+  expect(unseen(list, seen)).toEqual([{ backendId: "a" }, { backendId: "b" }]);
+  expect(unseen(list, seen)).toEqual([]);
+  // A retry refused again: Hooks appends one and drops the oldest.
+  const again = { backendId: "a" };
+  list.push(again);
+  list.splice(0, 1);
+  expect(unseen(list, seen)).toEqual([again]);
+  expect(unseen(list, seen)).toEqual([]);
+});
+
+test("a configuration refusal Hooks records after startup reaches the logins", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  const adapter = new Adapter({} as ExtensionAPI);
+  const diagnostics: Hooks["initializationDiagnostics"] = [];
+  adapter.hooks = { initializationDiagnostics: diagnostics } as unknown as Hooks;
+  adapter.logins = logins;
+  adapter.initialization(true);
+  await signIn(as, host, logins);
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+  // The sign-in made Hooks retry the skipped backend's configuration: refused for root.
+  diagnostics.push({ backendId: ID, code: "configuration_unavailable", authError: "access_denied", recovery: "none", requiredScopes: ["root"] });
+  adapter.initialization();
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain("not allowed: root;");
 });

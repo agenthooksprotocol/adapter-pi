@@ -92,10 +92,19 @@ function bindingScopes(binding: Record<string, unknown> | undefined): string[] {
   return binding?.type === "oauth" && Array.isArray(binding.scopes) ? (binding.scopes as string[]) : [];
 }
 
-/** The scopes a backend may have, as `#select` gives them: oauth.scopes, else each
- * endpoint's binding's. A failure does not name its endpoint, so all of them. */
-function ceiling(backend: BackendAuth): string[] {
-  return backend.settings.scopes ?? [...new Set(backend.endpoints.flatMap((endpoint) => bindingScopes(endpoint.authentication)))];
+/** The scopes an endpoint may have, as `#select` gives them: oauth.scopes, else
+ * its binding's. */
+function allowedAt(backend: BackendAuth, endpoint: Endpoint): string[] {
+  return backend.settings.scopes ?? bindingScopes(endpoint.authentication);
+}
+
+/** An access_denied that named scopes. `outside`: allowed on no endpoint.
+ * `partial`: allowed on some endpoints, not on every one. Neither: the issuer
+ * granted fewer than asked, which no setting here changes. */
+interface Refusal {
+  required: readonly string[];
+  outside: string[];
+  partial: string[];
 }
 
 function code(error: unknown): string {
@@ -115,8 +124,9 @@ export class Logins {
   readonly #active = new Map<string, Active>();
   readonly #ensuring = new Map<string, Promise<"ready" | Active | string>>();
   readonly #told = new Set<string>();
-  /** Scopes a login was refused for: outside what this backend may have. */
-  readonly #outside = new Map<string, readonly string[]>();
+  /** The last access_denied that named scopes. The allowed scopes are fixed for
+   * this instance, so a sign-in never lifts it: a bare access_denied or a sign-out does. */
+  readonly #refusals = new Map<string, Refusal>();
 
   constructor(readonly host: LoginHost, agentDir: string, backends: readonly Record<string, unknown>[], options: LoginOptions = {}) {
     this.store = new FileTokenStore(join(agentDir, "ahp-auth.json"));
@@ -219,13 +229,26 @@ export class Logins {
     }
   }
 
-  /** Scopes the backend may not have: required ones outside its configured scopes.
-   * Fewer granted than asked for is the issuer's choice, not this. */
-  #refused(id: string, required: readonly string[]): void {
-    const allowed = ceiling(this.#backends.get(id)!);
-    const outside = required.filter((scope) => !allowed.includes(scope));
-    if (outside.length) this.#outside.set(id, outside);
-    else this.#outside.delete(id);
+  /** Record an access_denied's scopes, judged against what each endpoint may
+   * have: `endpoint` when the failure names one, else every endpoint (the SDK
+   * checks the delivering endpoint's own scopes). */
+  #refused(id: string, required: readonly string[], endpoint?: Endpoint): void {
+    if (!required.length) {
+      this.#refusals.delete(id);
+      return;
+    }
+    const backend = this.#backends.get(id)!;
+    const each = (endpoint ? [endpoint] : backend.endpoints).map((one) => allowedAt(backend, one));
+    const union = new Set(backend.endpoints.flatMap((one) => allowedAt(backend, one)));
+    const outside = required.filter((scope) => !union.has(scope));
+    const partial = required.filter((scope) => union.has(scope) && each.some((allowed) => !allowed.includes(scope)));
+    this.#refusals.set(id, { required, outside, partial });
+  }
+
+  /** A refusal a sign-in cannot fix: scopes some endpoint is not allowed. */
+  #refusal(id: string): Refusal | undefined {
+    const refusal = this.#refusals.get(id);
+    return refusal && (refusal.outside.length || refusal.partial.length) ? refusal : undefined;
   }
 
   /** A turn starts: prepare, in the background, each login a delivery asked for,
@@ -289,7 +312,7 @@ export class Logins {
       receiver?.close();
       const failure = code(error);
       // Step-up scopes beyond the ceiling fail access_denied, naming them.
-      if (error instanceof AuthError && error.code === "access_denied") this.#refused(backend.id, error.requiredScopes ?? []);
+      if (error instanceof AuthError && error.code === "access_denied") this.#refused(backend.id, error.requiredScopes ?? [], endpoint);
       this.#needed.delete(backend.id);
       this.#failing.set(backend.id, failure);
       return failure;
@@ -388,8 +411,6 @@ export class Logins {
       this.#told.delete(id);
     }
     this.#failing.delete(id);
-    // A grant completed or found ready: an earlier refusal is old news.
-    this.#outside.delete(id);
     const active = this.#active.get(id);
     if (!active) return;
     this.#active.delete(id);
@@ -443,14 +464,13 @@ export class Logins {
     if (backend.preset?.type === "bearer") return "bearer token from hooks.json";
     if (!(await this.#relevant(backend))) return "no sign-in needed";
     const failing = this.#failing.get(backend.id);
-    // Read first: a grant found ready clears it.
-    const outside = this.#outside.get(backend.id);
     const result = await this.#ensure(backend);
+    const refusal = this.#refusal(backend.id);
     if (result === "ready") {
       const flow = backend.settings.flow ?? backend.preset?.flow;
-      return `${flow === "client_credentials" ? "client-credentials" : "authorized"}${outside ? `, but refused${hint("access_denied", outside)}` : ""}`;
+      return `${flow === "client_credentials" ? "client-credentials" : "authorized"}${refusal ? `, but refused${hint("access_denied", refusal)}` : ""}`;
     }
-    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result, this.#outside.get(backend.id))}`;
+    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result, this.#refusals.get(backend.id))}`;
     return `needs-login: ${result.login.authorizationUrl}`;
   }
 
@@ -465,10 +485,10 @@ export class Logins {
         this.host.notify(`${backend.id} is a local process: it has no sign-in.`, "warning");
         continue;
       }
-      const outside = this.#outside.get(backend.id);
       const result = await this.#ensure(backend);
-      if (result === "ready" && outside) {
-        this.host.notify(`${backend.id} is signed in, but a sign-in cannot fix what it was refused${hint("access_denied", outside)}`, "warning");
+      const refusal = this.#refusal(backend.id);
+      if (result === "ready" && refusal) {
+        this.host.notify(`${backend.id} is signed in, but a sign-in cannot fix what it was refused${hint("access_denied", refusal)}`, "warning");
         reported++;
         continue;
       }
@@ -477,7 +497,7 @@ export class Logins {
         continue;
       }
       if (typeof result === "string") {
-        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result, this.#outside.get(backend.id))}`, "warning");
+        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result, this.#refusals.get(backend.id))}`, "warning");
         reported++;
         continue;
       }
@@ -544,14 +564,22 @@ export class Logins {
       });
     }
     this.#done(id);
-    this.#outside.delete(id);
+    this.#refusals.delete(id);
     this.host.notify(`Signed out of ${id}.`);
   }
 }
 
-function hint(failure: string, outside?: readonly string[]): string {
+function hint(failure: string, refusal?: Refusal): string {
   if (failure === "credential_unavailable") return " (no client: set oauth.clientId, oauth.clientMetadataDocument, or oauth.issuer with oauth.registration in hooks.json)";
-  if (failure === "access_denied" && outside?.length) return ` (it needs scopes this backend is not allowed: ${outside.join(" ")}; add them to oauth.scopes in hooks.json to allow them)`;
+  if (failure === "access_denied" && refusal) {
+    const parts: string[] = [];
+    if (refusal.outside.length) parts.push(`it needs scopes this backend is not allowed: ${refusal.outside.join(" ")}; add them to oauth.scopes in hooks.json to allow them`);
+    if (refusal.partial.length) parts.push(`it needs scopes not allowed on every endpoint: ${refusal.partial.join(" ")}; set oauth.scopes in hooks.json`);
+    // Every scope was allowed: the issuer granted fewer than asked for.
+    if (!parts.length) parts.push(`the issuer did not grant ${refusal.required.join(" ")}`);
+    return ` (${parts.join("; ")})`;
+  }
+  // Only an access_denied that names no scopes is about trust.
   if (failure === "access_denied") return " (the issuer is not trusted: set oauth.issuer, or oauth.trustAdvertisedIssuer for a browser sign-in, in hooks.json)";
   if (failure === "untrusted_destination") return " (a private address: set oauth.allowPrivateNetwork in hooks.json)";
   return "";
