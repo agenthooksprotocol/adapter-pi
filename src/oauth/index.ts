@@ -4,24 +4,20 @@
 // Deliveries never create a login. They fail `interaction_required`, and the
 // failure's diagnostic marks the backend; at the next turn the adapter prepares a
 // login in the background and shows its link where only the person sees it (a
-// widget and a notification, never the transcript). A pending login is stored and
-// reused until it expires, so every turn shows the same link. `/ahp login`,
-// `/ahp status` and `/ahp logout` are the explicit controls.
+// widget and a notification, never the transcript). `/ahp login`, `/ahp status`
+// and `/ahp logout` are the explicit controls.
+//
+// As in MCP clients, a login belongs to the pi that prepared it: it listens on a
+// port of its own for the redirect, keeps showing the same link until the login
+// ends, and completes it. Grants are shared through the store, so every pi uses
+// the newest sign-in, and drops its own link once it sees one.
 //
 // Each backend has its own grants: the grant partition is the backend id, so one
 // sign-in covers its event and upload endpoints, and no other backend's.
-import { auth, AuthError, type DeliveryAuthFailure, type DeliveryAuthProvider } from "agenthooksprotocol/client";
-import {
-  bindingKey,
-  frame,
-  managedOAuth,
-  type ClientConfig,
-  type Operation,
-  type PendingLogin,
-  type StoredRecord,
-} from "agenthooksprotocol/oauth";
+import { auth, AuthError, type DeliveryAuthContext, type DeliveryAuthFailure, type DeliveryAuthProvider } from "agenthooksprotocol/client";
+import { bindingKey, managedOAuth, type ClientConfig, type Operation, type PendingLogin, type StoredRecord } from "agenthooksprotocol/oauth";
 import { join } from "node:path";
-import { receive } from "./callback.js";
+import { receive, type Receiver } from "./callback.js";
 import { networkPolicy } from "./network.js";
 import { backendAuth, trustedIssuer, type BackendAuth, type Endpoint } from "./settings.js";
 import { FileSecrets, FileTokenStore } from "./store.js";
@@ -30,7 +26,6 @@ export const NAMESPACE = "dev.pi";
 const SOFTWARE_ID = "@agenthooksprotocol/adapter-pi";
 const DELIVERY_BUDGET_MS = 60_000;
 const PREPARE_BUDGET_MS = 60_000;
-const POLL_MS = 250;
 
 /** What the logins need from pi. Every call reads the latest session context. */
 export interface LoginHost {
@@ -48,6 +43,19 @@ type Managed = ReturnType<typeof managedOAuth>;
 
 interface Backend extends BackendAuth {
   oauth: Managed;
+}
+
+/** A login this pi prepared, and the listener for its redirect. */
+interface Active {
+  login: PendingLogin;
+  receiver: Receiver;
+  /** Scopes it was prepared for: a grant from elsewhere must cover them. */
+  required: readonly string[];
+  /** The grant when it was prepared: a newer one means someone signed in. */
+  grant: { key: string; record: StoredRecord | undefined } | undefined;
+  expiry?: ReturnType<typeof setTimeout>;
+  /** `/ahp login` waiting for the login to end. */
+  waiters: (() => void)[];
 }
 
 function budget(ms: number, signal?: AbortSignal): Operation {
@@ -68,8 +76,8 @@ export class Logins {
   readonly #needed = new Map<string, readonly string[] | undefined>();
   /** The last authentication failure that a login will not fix. */
   readonly #failing = new Map<string, string>();
-  readonly #pending = new Map<string, PendingLogin>();
-  readonly #preparing = new Set<string>();
+  readonly #active = new Map<string, Active>();
+  readonly #ensuring = new Map<string, Promise<"ready" | Active | string>>();
   readonly #told = new Set<string>();
 
   constructor(readonly host: LoginHost, agentDir: string, backends: readonly Record<string, unknown>[]) {
@@ -99,6 +107,11 @@ export class Logins {
     const oauth: DeliveryAuthProvider = {
       credential: (context) => route(context.backendId).credential(context),
       challenge: (context) => route(context.backendId).challenge(context),
+      // A sign-in lets Hooks retry a backend whose configuration discovery it skipped.
+      onPrepared: (listener) => {
+        const stops = [...providers.values()].map((provider) => provider.onPrepared!(listener));
+        return () => stops.forEach((stop) => stop());
+      },
     };
     this.provider = auth.compose({
       bearer: auth.bearer({ resolveCredentialReference: (reference, context) => this.secrets.get(reference, context.signal ?? new AbortController().signal) }),
@@ -137,7 +150,6 @@ export class Logins {
       grantPartition: backend.id,
       ...(clientId !== undefined ? { clientId } : {}),
       ...(clientSecret !== undefined ? { clientSecret } : {}),
-      ...(flow === "authorization_code_pkce" ? { redirectUri: backend.redirectUri } : {}),
       ...(settings.clientMetadataDocument ? { clientMetadataDocument: settings.clientMetadataDocument } : {}),
       ...(settings.registration && issuer === settings.issuer
         ? { registration: { clientName: "pi (Agent Hooks Protocol)", softwareId: SOFTWARE_ID, ...settings.registration } }
@@ -161,45 +173,63 @@ export class Logins {
     }
   }
 
-  /** A turn starts: prepare, in the background, each login a delivery asked for. */
+  /** A turn starts: prepare, in the background, each login a delivery asked for,
+   * and drop the links of logins another pi made unnecessary. */
   turnStart(): void {
-    // And each link shown: another pi may have completed it, or released its port.
-    for (const id of new Set([...this.#needed.keys(), ...this.#pending.keys()])) {
-      if (this.#preparing.has(id)) continue;
+    for (const id of new Set([...this.#needed.keys(), ...this.#active.keys()])) {
       if (!this.host.hasUI) {
         // No one to show a link to, and nothing listening once this run ends.
         if (!this.#told.has(id)) this.host.notify(`Agent Hooks Protocol: ${id} needs a sign-in; run /ahp login ${id} in an interactive pi.`, "warning");
         this.#told.add(id);
         continue;
       }
-      this.#preparing.add(id);
-      void this.#hint(id).finally(() => this.#preparing.delete(id));
+      void this.#ensure(this.#backends.get(id)!).then((result) => {
+        if (typeof result === "string" && result !== "ready") this.host.log(`${id}: sign-in not prepared: ${result}`);
+      });
     }
   }
 
-  async #hint(id: string): Promise<void> {
-    const backend = this.#backends.get(id)!;
-    // The stored login this process already shows: nothing to prepare.
-    const shown = this.#pending.get(id);
-    if (shown && shown.expiresAt > Date.now() && (await this.#stillPending(backend, shown))) return this.#listen(backend, shown);
-    const result = await this.#prepare(backend);
-    if (typeof result === "string") this.host.log(`${id}: sign-in not prepared: ${result}`);
+  /** Signed in, this pi's own live login (prepared now if there is none), or a failure code. */
+  #ensure(backend: Backend): Promise<"ready" | Active | string> {
+    const running = this.#ensuring.get(backend.id);
+    if (running) return running;
+    const work = (async () => {
+      const active = this.#active.get(backend.id);
+      if (active) {
+        if (active.login.expiresAt > Date.now() && !(await this.#grantedElsewhere(active))) return active;
+        await this.#end(backend, active);
+      }
+      return this.#prepare(backend);
+    })().finally(() => this.#ensuring.delete(backend.id));
+    this.#ensuring.set(backend.id, work);
+    return work;
   }
 
-  /** Host prepare: ready, a pending login (shown and received), or a failure code. */
-  async #prepare(backend: Backend): Promise<"ready" | PendingLogin | string> {
+  /** Host prepare, with a listener of its own for the login it may create. */
+  async #prepare(backend: Backend): Promise<"ready" | Active | string> {
     const endpoint = backend.endpoints[0];
     if (!endpoint) return "unsupported_binding";
     const requiredScopes = this.#needed.get(backend.id);
+    let receiver: Receiver | undefined;
     try {
-      const result = await backend.oauth.prepare(this.#context(backend, endpoint), budget(PREPARE_BUDGET_MS), requiredScopes ? { requiredScopes } : {});
+      receiver = await receive((callback) => this.#complete(backend, callback));
+      const context = this.#context(backend, endpoint);
+      const result = await backend.oauth.prepare(context, budget(PREPARE_BUDGET_MS), { redirectUri: receiver.redirectUri, ...(requiredScopes ? { requiredScopes } : {}) });
       if (result.type === "ready") {
+        receiver.close();
         this.#done(backend.id);
         return "ready";
       }
-      await this.#show(backend, result);
-      return result;
+      receiver.state = result.state;
+      const active: Active = { login: result, receiver, required: requiredScopes ?? [], grant: await this.#grant(context), waiters: [] };
+      active.expiry = setTimeout(() => void this.#end(backend, active), Math.max(0, result.expiresAt - Date.now()));
+      active.expiry.unref();
+      this.#active.set(backend.id, active);
+      this.#render();
+      this.host.notify(`Sign in to ${backend.id}: ${result.authorizationUrl}`);
+      return active;
     } catch (error) {
+      receiver?.close();
       const failure = code(error);
       this.#needed.delete(backend.id);
       this.#failing.set(backend.id, failure);
@@ -211,68 +241,68 @@ export class Logins {
     return { backendId: backend.id, purpose: endpoint.purpose, url: endpoint.url, ...(endpoint.authentication ? { authentication: endpoint.authentication as never } : {}) };
   }
 
-  #pendingKey(backend: BackendAuth, endpoint: Endpoint): string {
-    return frame("ahp.oauth.pending:", [bindingKey(NAMESPACE, this.#context(backend, endpoint))]);
+  /** The stored grant this endpoint's binding names, if any. */
+  async #grant(context: DeliveryAuthContext): Promise<{ key: string; record: StoredRecord | undefined } | undefined> {
+    const signal = AbortSignal.timeout(10_000);
+    const binding = await this.store.load(bindingKey(NAMESPACE, context), signal).catch(() => undefined);
+    const key = binding?.kind === "binding" ? binding.grantKey : undefined;
+    return key ? { key, record: await this.store.load(key, signal).catch(() => undefined) } : undefined;
   }
 
-  async #load(key: string): Promise<StoredRecord | undefined> {
-    return this.store.load(key, AbortSignal.timeout(10_000));
+  /** Another pi completed a sign-in since this login was prepared: the grant, shared
+   * through the store, now has tokens covering what this login asked for. */
+  async #grantedElsewhere(active: Active): Promise<boolean> {
+    if (!active.grant) return false;
+    const record = await this.store.load(active.grant.key, AbortSignal.timeout(10_000)).catch(() => undefined);
+    if (record?.kind !== "grant" || record.generation === active.grant.record?.generation) return false;
+    return (record.token !== undefined || record.refreshToken !== undefined) && active.required.every((scope) => record.scopes.includes(scope));
   }
 
-  async #stillPending(backend: BackendAuth, login: PendingLogin): Promise<boolean> {
-    const record = await this.#load(login.key).catch(() => undefined);
-    return record?.kind === "pending_login" && record.id === login.id && record.expiresAt > Date.now();
-  }
-
-  /** Listen for the login's whole lifetime, and show its link. */
-  async #show(backend: Backend, login: PendingLogin): Promise<void> {
-    const previous = this.#pending.get(backend.id);
-    this.#pending.set(backend.id, login);
-    await this.#listen(backend, login);
-    this.#render();
-    if (previous?.authorizationUrl !== login.authorizationUrl) this.host.notify(`Sign in to ${backend.id}: ${login.authorizationUrl}`);
-  }
-
-  /** Receive the login's redirect, or keep trying while another pi holds the port. */
-  async #listen(backend: Backend, login: PendingLogin): Promise<void> {
-    await receive(backend.settings.redirectPort, login.expiresAt + 5_000, backend.id, (callback) => this.#callback(backend, callback))
-      .catch((error) => this.host.log(`${backend.id}: no callback listener: ${String(error)}`));
-  }
-
-  /** A redirect reached the listener: complete the login it belongs to. */
-  async #callback(backend: Backend, callback: string): Promise<{ ok: boolean; message: string } | undefined> {
-    const endpoint = backend.endpoints[0];
-    if (!endpoint) return undefined;
-    const key = this.#pendingKey(backend, endpoint);
-    const record = await this.#load(key);
-    if (record?.kind !== "pending_login" || new URL(callback).searchParams.get("state") !== record.state) return undefined;
-    const login: PendingLogin = { type: "pending_login", authorizationUrl: record.authorizationUrl, expiresAt: record.expiresAt, key, id: record.id };
-    return this.#complete(backend, login, callback);
-  }
-
-  async #complete(backend: Backend, login: PendingLogin, callback: string): Promise<{ ok: boolean; message: string }> {
+  /** A redirect reached this login's listener, or was pasted into this pi. */
+  async #complete(backend: Backend, callback: string): Promise<{ ok: boolean; message: string }> {
     try {
-      await backend.oauth.complete(login, callback, budget(PREPARE_BUDGET_MS));
+      await backend.oauth.complete(callback, budget(PREPARE_BUDGET_MS));
       this.#done(backend.id);
       this.host.notify(`Signed in to ${backend.id}.`);
       return { ok: true, message: `Signed in to ${backend.id}. You can close this tab.` };
     } catch (error) {
       const failure = code(error);
+      // A login that failed has ended; the next turn or /ahp login makes another.
+      const active = this.#active.get(backend.id);
+      if (active && new URL(callback, "http://invalid").searchParams.get("state") === active.login.state) await this.#end(backend, active);
       this.host.notify(`Sign-in to ${backend.id} failed: ${failure}.`, "warning");
       return { ok: false, message: `Sign-in to ${backend.id} failed (${failure}). Run /ahp login ${backend.id} in pi to try again.` };
     }
+  }
+
+  /** End this pi's login: expired, failed, superseded or signed out. */
+  async #end(backend: Backend, active: Active): Promise<void> {
+    if (this.#active.get(backend.id) !== active) return;
+    this.#active.delete(backend.id);
+    this.#stop(active);
+    this.#render();
+    await backend.oauth.cancel(active.login, budget(10_000)).catch(() => {});
+  }
+
+  #stop(active: Active): void {
+    clearTimeout(active.expiry);
+    active.receiver.close();
+    for (const settle of active.waiters.splice(0)) settle();
   }
 
   #done(id: string): void {
     this.#needed.delete(id);
     this.#failing.delete(id);
     this.#told.delete(id);
-    if (this.#pending.delete(id)) this.#render();
+    const active = this.#active.get(id);
+    if (!active) return;
+    this.#active.delete(id);
+    this.#stop(active);
+    this.#render();
   }
 
   #render(): void {
-    const now = Date.now();
-    const lines = [...this.#pending].filter(([, login]) => login.expiresAt > now).map(([id, login]) => `Sign in to ${id}: ${login.authorizationUrl}`);
+    const lines = [...this.#active].map(([id, active]) => `Sign in to ${id}: ${active.login.authorizationUrl}`);
     try {
       this.host.widget(lines.length ? lines : undefined);
     } catch {
@@ -285,7 +315,7 @@ export class Logins {
     const endpoint = backend.endpoints[0];
     if (!endpoint || backend.headerAuthorization || backend.preset?.type === "bearer") return false;
     if (backend.preset?.type === "oauth" || backend.configured || this.#needed.has(backend.id) || this.#failing.has(backend.id)) return true;
-    const binding = await this.#load(bindingKey(NAMESPACE, this.#context(backend, endpoint))).catch(() => undefined);
+    const binding = await this.store.load(bindingKey(NAMESPACE, this.#context(backend, endpoint)), AbortSignal.timeout(10_000)).catch(() => undefined);
     return binding !== undefined;
   }
 
@@ -317,13 +347,13 @@ export class Logins {
     if (backend.preset?.type === "bearer") return "bearer token from hooks.json";
     if (!(await this.#relevant(backend))) return "no sign-in needed";
     const failing = this.#failing.get(backend.id);
-    const result = await this.#prepare(backend);
+    const result = await this.#ensure(backend);
     if (result === "ready") {
       const flow = backend.settings.flow ?? backend.preset?.flow;
       return flow === "client_credentials" ? "client-credentials" : "authorized";
     }
     if (typeof result === "string") return `failing: ${failing ?? result}${hint(result)}`;
-    return `needs-login: ${result.authorizationUrl}`;
+    return `needs-login: ${result.login.authorizationUrl}`;
   }
 
   async #login(target: string | undefined): Promise<void> {
@@ -335,7 +365,7 @@ export class Logins {
         this.host.notify(`${backend.id} is a local process: it has no sign-in.`, "warning");
         continue;
       }
-      const result = await this.#prepare(backend);
+      const result = await this.#ensure(backend);
       if (result === "ready") {
         if (target) this.host.notify(`${backend.id} is already signed in. /ahp logout ${backend.id} first to sign in as someone else.`);
         continue;
@@ -351,52 +381,33 @@ export class Logins {
   }
 
   /** Open the browser and wait for the redirect, or for a pasted one. */
-  async #signIn(backend: Backend, login: PendingLogin): Promise<void> {
-    this.host.open(login.authorizationUrl);
+  async #signIn(backend: Backend, active: Active): Promise<void> {
+    this.host.open(active.login.authorizationUrl);
     const stop = new AbortController();
-    const received = this.#untilEnded(backend, login, stop.signal).then(() => ({ type: "received" as const }));
-    const contenders: Promise<{ type: "received" } | { type: "pasted"; value: string | undefined }>[] = [received];
+    const ended = new Promise<{ type: "ended" }>((resolve) => active.waiters.push(() => resolve({ type: "ended" })));
+    const contenders: Promise<{ type: "ended" } | { type: "pasted"; value: string | undefined }>[] = [ended];
     if (this.host.hasUI) {
       contenders.push(this.host.input(`Sign in to ${backend.id}`, "If the browser cannot reach pi, paste the address it ended on", stop.signal).then((value) => ({ type: "pasted" as const, value })));
     } else {
-      console.error(`Sign in to ${backend.id}: ${login.authorizationUrl}`);
+      console.error(`Sign in to ${backend.id}: ${active.login.authorizationUrl}`);
     }
     const first = await Promise.race(contenders);
     stop.abort();
-    await received.catch(() => {});
-    if (first.type === "pasted") {
-      if (first.value?.trim()) await this.#complete(backend, login, first.value.trim());
-      return;
-    }
-    // Completed here or by another pi, cancelled, or expired.
-    if (this.#pending.get(backend.id)?.id === login.id) {
-      const result = await this.#prepare(backend);
-      if (result !== "ready") this.host.notify(`Sign-in to ${backend.id} did not complete.`, "warning");
-      else this.host.notify(`Signed in to ${backend.id}.`);
-    }
-  }
-
-  async #untilEnded(backend: BackendAuth, login: PendingLogin, signal: AbortSignal): Promise<void> {
-    while (!signal.aborted && (await this.#stillPending(backend, login))) {
-      await new Promise((resolve) => setTimeout(resolve, POLL_MS));
-    }
+    // The paste completes here, in the pi that owns the login.
+    if (first.type === "pasted" && first.value?.trim()) await this.#complete(backend, first.value.trim());
   }
 
   async #logout(id: string): Promise<void> {
     const backend = this.#backends.get(id)!;
     const signal = AbortSignal.timeout(30_000);
+    const active = this.#active.get(id);
+    if (active) await this.#end(backend, active);
     for (const endpoint of backend.endpoints) {
-      const key = this.#pendingKey(backend, endpoint);
-      const pending = await this.store.load(key, signal);
-      if (pending?.kind === "pending_login") {
-        await backend.oauth.cancel({ type: "pending_login", authorizationUrl: pending.authorizationUrl, expiresAt: pending.expiresAt, key, id: pending.id }, budget(30_000));
-      }
-      const binding = await this.store.load(bindingKey(NAMESPACE, this.#context(backend, endpoint)), signal);
-      const grantKey = binding?.kind === "binding" ? binding.grantKey : undefined;
-      if (!grantKey) continue;
-      await this.store.coordinate(grantKey, signal, async () => {
-        const grant = await this.store.load(grantKey, signal);
-        if (grant) await this.store.compareAndSet(grantKey, grant.generation, undefined, signal);
+      const grant = await this.#grant(this.#context(backend, endpoint));
+      if (!grant) continue;
+      await this.store.coordinate(grant.key, signal, async () => {
+        const record = await this.store.load(grant.key, signal);
+        if (record) await this.store.compareAndSet(grant.key, record.generation, undefined, signal);
       });
     }
     this.#done(id);

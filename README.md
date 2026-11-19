@@ -87,6 +87,8 @@ OAuth gets a browser sign-in:
   widget above the editor and a notification: pi's own UI, never the transcript the
   model reads. Every turn shows the same link until it expires (10 minutes at most);
   then the next turn shows a fresh one. Backends that are signed in are left alone.
+  When another pi signs in to the backend first, this one drops its link at its next
+  turn and uses that sign-in.
 - **Commands.** `/ahp status` says, per backend, `authorized`, `needs-login` with the
   link, `client-credentials`, or `failing` with why. `/ahp login [backend]` opens the
   browser (`$BROWSER`, or the platform's opener; `BROWSER=none` for none) and asks for
@@ -97,11 +99,12 @@ OAuth gets a browser sign-in:
   sign-in to stderr and relies on client credentials; `pi -p "/ahp login <backend>"`
   prints the link and waits for it.
 
-pi listens on `http://127.0.0.1:<port>/callback` for as long as a sign-in is pending,
-so a click any time before it expires completes it. The port is fixed per backend, so
-every pi process uses the same redirect; when several run, one listens, and any of them
-can complete the sign-in. One sign-in covers a backend's event and upload endpoints,
-and no other backend's.
+As in MCP clients, each sign-in belongs to the pi that showed its link: that pi
+listens on `http://127.0.0.1:<port>/callback`, on a port picked for that sign-in, for
+as long as it is pending, and completes it (a pasted address too). Several pi
+processes may each show their own link; the newest completed sign-in is the one they
+all use, since tokens are shared. One sign-in covers a backend's event and upload
+endpoints, and no other backend's.
 
 Settings go in an `oauth` object on the backend, beside its `authentication`
 (receivers ignore fields they do not know). All are optional:
@@ -125,9 +128,8 @@ Settings go in an `oauth` object on the backend, beside its `authentication`
 | `scopes` | Scopes to request. |
 | `clientId` | A client registered for pi in advance. It always wins. |
 | `clientSecretRef` | For client credentials: a key in `ahp-secrets.json`. |
-| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document you publish, used where the issuer supports them. `redirectUris` must include this backend's redirect. The adapter publishes none of its own: a document lists exact redirects, and pi's are per backend. |
+| `clientMetadataDocument` | `{ "url", "redirectUris" }`: a Client ID Metadata Document you publish, used where the issuer supports them. `redirectUris` must include `http://127.0.0.1/callback`: loopback redirects match without their port, so it covers every sign-in's. |
 | `registration` | `true`, or `{ "clientName", "scopes", "initialAccessTokenRef" }`: permission to register a client (RFC 7591) at `issuer`, which it requires. |
-| `redirectPort` | The callback port (1024–65535). Default: one derived from the backend id. |
 | `loginLifetimeMinutes` | How long a sign-in link lasts, up to 10 (the default). |
 | `allowPrivateNetwork` | Allow the authorization server on loopback or private addresses. Default `false`. |
 
@@ -142,9 +144,10 @@ the public addresses they resolved (unless `allowPrivateNetwork`).
 pi has no credential store, so the adapter keeps two files in pi's agent directory
 (`~/.pi/agent`, or `$PI_CODING_AGENT_DIR`), each written atomically with mode `0600`:
 
-- `ahp-auth.json`: tokens, refresh tokens, pending sign-ins, discovery results and
-  registered client ids, shared by every pi process of the user. Locks are under
-  `ahp-auth.locks/` and `ahp-auth.json.lock`.
+- `ahp-auth.json`: tokens, refresh tokens, discovery results and registered client
+  ids, shared by every pi process of the user, so a refresh in one is the token the
+  others read. Locks are under `ahp-auth.locks/` and `ahp-auth.json.lock`. Pending
+  sign-ins stay in the pi that started them.
 - `ahp-secrets.json`: client secrets, apart from tokens. Add your own as
   `{ "version": 1, "secrets": { "<ref>": "<secret>" } }` for `clientSecretRef`,
   `tokenRef` or `initialAccessTokenRef`; secrets of registered clients go here too.

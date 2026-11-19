@@ -9,14 +9,11 @@
 //     "scopes": ["hooks"],
 //     "clientId": "pi",                       // a pre-registered client, or:
 //     "clientSecretRef": "example-secret",    // client credentials: a key in ahp-secrets.json
-//     "clientMetadataDocument": { "url": "https://…/client.json", "redirectUris": ["http://127.0.0.1:33418/callback"] },
+//     "clientMetadataDocument": { "url": "https://…/client.json", "redirectUris": ["http://127.0.0.1/callback"] },
 //     "registration": true,                   // or { "clientName", "scopes", "initialAccessTokenRef" }: DCR at `issuer`
-//     "redirectPort": 33418,
 //     "loginLifetimeMinutes": 10,
 //     "allowPrivateNetwork": false
 //   }
-import { redirectUri } from "./callback.js";
-
 export type Flow = "authorization_code_pkce" | "client_credentials";
 
 export interface Endpoint {
@@ -37,7 +34,6 @@ export interface OAuthSettings {
   clientSecretRef?: string;
   clientMetadataDocument?: { url: string; redirectUris: string[] };
   registration?: { clientName?: string; scopes?: string[]; initialAccessTokenRef?: string };
-  redirectPort: number;
   loginLifetimeMs: number;
   allowPrivateNetwork: boolean;
 }
@@ -53,7 +49,6 @@ export interface BackendAuth {
   /** An `oauth` object was given: the person expects OAuth here. */
   configured: boolean;
   settings: OAuthSettings;
-  redirectUri: string;
 }
 
 const MAX_LIFETIME_MS = 600_000;
@@ -64,13 +59,6 @@ function object(value: unknown): value is Record<string, unknown> {
 
 function strings(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((item) => typeof item === "string" && item.length > 0);
-}
-
-/** A stable port per backend: every pi process derives the same redirect. */
-export function defaultPort(id: string): number {
-  let hash = 0x811c9dc5;
-  for (const byte of new TextEncoder().encode(id)) hash = Math.imul(hash ^ byte, 0x01000193) >>> 0;
-  return 20000 + (hash % 10000);
 }
 
 /** Read one backend; problems name settings that were ignored. */
@@ -94,7 +82,7 @@ export function backendAuth(backend: Record<string, unknown>): { auth: BackendAu
   const headerAuthorization = Object.keys(headers).some((name) => name.toLowerCase() === "authorization");
 
   const raw = backend.oauth;
-  const settings: OAuthSettings = { trustAdvertisedIssuer: false, redirectPort: defaultPort(id), loginLifetimeMs: MAX_LIFETIME_MS, allowPrivateNetwork: false };
+  const settings: OAuthSettings = { trustAdvertisedIssuer: false, loginLifetimeMs: MAX_LIFETIME_MS, allowPrivateNetwork: false };
   const ignore = (name: string, why: string) => problems.push(`${id}: oauth.${name} ${why}; ignored`);
   if (raw !== undefined && !object(raw)) problems.push(`${id}: oauth is not an object; ignored`);
   const given = object(raw) ? raw : {};
@@ -136,11 +124,8 @@ export function backendAuth(backend: Record<string, unknown>): { auth: BackendAu
       ignore("registration", "needs oauth.issuer");
     }
   }
-  if (given.redirectPort !== undefined) {
-    const port = given.redirectPort;
-    if (typeof port === "number" && Number.isInteger(port) && port >= 1024 && port <= 65535) settings.redirectPort = port;
-    else ignore("redirectPort", "is not a port from 1024 to 65535");
-  }
+  // Each sign-in listens on a port of its own, as MCP clients do.
+  if (given.redirectPort !== undefined) ignore("redirectPort", "is no longer used: each sign-in picks its own port");
   if (given.loginLifetimeMinutes !== undefined) {
     const minutes = given.loginLifetimeMinutes;
     if (typeof minutes === "number" && minutes > 0 && minutes <= 10) settings.loginLifetimeMs = Math.round(minutes * 60_000);
@@ -162,7 +147,6 @@ export function backendAuth(backend: Record<string, unknown>): { auth: BackendAu
       headerAuthorization,
       configured: object(raw),
       settings,
-      redirectUri: redirectUri(settings.redirectPort),
     },
     problems,
   };

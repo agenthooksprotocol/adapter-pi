@@ -1,7 +1,9 @@
-// OAuth state shared by every pi process of one user: grants, bindings, pending
-// logins and registrations in one 0600 JSON file under pi's agent directory, and
-// client secrets in another. pi runs a process per terminal, RPC client and print
-// run, so a token refreshed in one must be the token the others read.
+// OAuth state shared by every pi process of one user: grants, bindings and
+// registrations in one 0600 JSON file under pi's agent directory, and client
+// secrets in another. pi runs a process per terminal, RPC client and print run, so
+// a token refreshed in one must be the token the others read: refreshes are
+// serialised across processes by `coordinate`. Pending logins stay in the process
+// that started them.
 //
 // Locks are directories: one for each file's read-modify-write, and one per key
 // for `coordinate`. A lock is taken by renaming a prepared directory, its owner

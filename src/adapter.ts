@@ -125,10 +125,10 @@ export class Adapter {
       }
       const hooks = await this.#client(registration);
       for (const issue of hooks.initializationDiagnostics ?? []) {
-        this.logins?.observe(issue.backendId, issue.auth);
+        this.logins?.observe(issue.backendId, issue.authError && issue.recovery ? { code: issue.authError, recovery: issue.recovery, ...(issue.requiredScopes ? { requiredScopes: issue.requiredScopes } : {}) } : undefined);
         // A login is shown at the next turn, not here: startup never waits on a person.
-        if (issue.auth?.recovery === "login") this.log(`${issue.backendId}: ${issue.code}: needs a sign-in`);
-        else this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}${issue.auth ? ` (${issue.auth.code})` : ""}`);
+        if (issue.recovery === "login") this.log(`${issue.backendId}: ${issue.code}: needs a sign-in`);
+        else this.warn(`Agent Hooks Protocol: ${issue.backendId}: ${issue.code}${issue.authError ? ` (${issue.authError})` : ""}`);
       }
       this.hooks = hooks;
       this.log(`delivering to ${registration.hooks.length} backend(s) from ${sources.map((source) => source.path).join(", ")}`);
