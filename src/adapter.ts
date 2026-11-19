@@ -275,6 +275,7 @@ export class Adapter {
   }
 
   async close(): Promise<void> {
+    await this.logins?.close();
     await this.flush();
     const hooks = this.hooks;
     this.hooks = undefined;

@@ -1271,4 +1271,73 @@ describe.each(VERSIONS)("pi %s", (version, cli) => {
       await backend.stop();
     }
   }));
+  test("OAuth: pi -p \"/ahp login\" prints the link once and stays until the redirect arrives", () => inWorld(async (world) => {
+    const backend = await protectedBackend();
+    try {
+      world.add(backend.backend());
+      const child = Bun.spawn(["node", cli, "-e", installed, "--provider", "fake", "--model", "m", "-p", "/ahp login org.example.protected"], {
+        cwd: world.project,
+        stdin: "ignore",
+        stdout: "ignore",
+        stderr: "pipe",
+        env: { PATH: process.env.PATH!, HOME: world.home, PI_CODING_AGENT_DIR: world.agent, PI_OFFLINE: "1", AHP_HOOKS_FILE: join(world.dir, "hooks.json"), NODE_EXTRA_CA_CERTS: (await tls()).file, BROWSER: "none" },
+      });
+      let stderr = "";
+      let exited = false;
+      void child.exited.then(() => (exited = true));
+      void (async () => {
+        for await (const chunk of child.stderr as unknown as AsyncIterable<Uint8Array>) stderr += new TextDecoder().decode(chunk);
+      })();
+      const prefix = "Sign in to org.example.protected: ";
+      await world.until(() => stderr.includes(prefix) || exited, "the printed link");
+      const lines = stderr.split("\n").filter((line) => line.startsWith(prefix));
+      // Printed once, not by both the notice and the sign-in.
+      expect(lines).toHaveLength(1);
+      // Nothing else holds pi open: the sign-in must, while the person signs in.
+      await Bun.sleep(6000);
+      expect(exited).toBe(false);
+      const landed = await fetch(await backend.consent(lines[0]!.slice(prefix.length)));
+      expect(landed.status).toBe(200);
+      expect(await child.exited).toBe(0);
+      expect(stderr).toContain("Signed in to org.example.protected.");
+      expect(backend.issued.size).toBe(1);
+    } finally {
+      await backend.stop();
+    }
+  }));
+
+  test("OAuth: a session that ends takes its links with it, so a later sign-out stays signed out", () => inWorld(async (world) => {
+    const backend = await protectedBackend();
+    try {
+      world.add(backend.backend());
+      world.start({ NODE_EXTRA_CA_CERTS: (await tls()).file, BROWSER: "none" });
+      await world.until(() => world.received.length > 0, "pi to start");
+      const link = async () => {
+        const marker = world.ui.length;
+        world.send({ type: "prompt", message: "/ahp status" });
+        await world.until(() => world.uiOf("notify", marker).some((request) => String(request.message).includes("org.example.protected: needs-login")), "the status");
+        return world.uiOf("setWidget", marker).filter((request) => request.widgetKey === "agent-hooks-protocol-login").at(-1)!.widgetLines[0].replace("Sign in to org.example.protected: ", "");
+      };
+      const old = await link();
+      world.send({ type: "new_session" });
+      await world.until(() => world.of("session.start").length === 2, "the new session");
+      // The ended session's listener is gone: its link signs nobody in.
+      await expect(fetch(await backend.consent(old))).rejects.toThrow();
+
+      // The new session's own link, then a sign-out: that link is dead too.
+      const fresh = await link();
+      expect(fresh).not.toBe(old);
+      const out = world.ui.length;
+      world.send({ type: "prompt", message: "/ahp logout org.example.protected" });
+      await world.until(() => world.uiOf("notify", out).some((request) => request.message === "Signed out of org.example.protected."), "the sign-out");
+      await expect(fetch(await backend.consent(fresh))).rejects.toThrow();
+      await expect(fetch(await backend.consent(old))).rejects.toThrow();
+      expect(backend.issued.size).toBe(0);
+      const status = world.ui.length;
+      world.send({ type: "prompt", message: "/ahp status" });
+      await world.until(() => world.uiOf("notify", status).some((request) => String(request.message).includes("org.example.protected: needs-login")), "the status after sign-out");
+    } finally {
+      await backend.stop();
+    }
+  }));
 });

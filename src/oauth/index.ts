@@ -388,13 +388,24 @@ export class Logins {
     const contenders: Promise<{ type: "ended" } | { type: "pasted"; value: string | undefined }>[] = [ended];
     if (this.host.hasUI) {
       contenders.push(this.host.input(`Sign in to ${backend.id}`, "If the browser cannot reach pi, paste the address it ended on", stop.signal).then((value) => ({ type: "pasted" as const, value })));
-    } else {
-      console.error(`Sign in to ${backend.id}: ${active.login.authorizationUrl}`);
     }
-    const first = await Promise.race(contenders);
-    stop.abort();
-    // The paste completes here, in the pi that owns the login.
-    if (first.type === "pasted" && first.value?.trim()) await this.#complete(backend, first.value.trim());
+    // The listener never keeps pi alive by itself: while a person is asked to sign
+    // in (`pi -p "/ahp login …"` too), this does, until the login ends.
+    const hold = setTimeout(() => {}, Math.max(0, active.login.expiresAt - Date.now()));
+    try {
+      const first = await Promise.race(contenders);
+      stop.abort();
+      // The paste completes here, in the pi that owns the login.
+      if (first.type === "pasted" && first.value?.trim()) await this.#complete(backend, first.value.trim());
+    } finally {
+      clearTimeout(hold);
+    }
+  }
+
+  /** The session ends (or pi replaces this instance): every login this pi shows
+   * ends with it, so an old link can never sign anyone in. */
+  async close(): Promise<void> {
+    await Promise.all([...this.#active].map(([id, active]) => this.#end(this.#backends.get(id)!, active)));
   }
 
   async #logout(id: string): Promise<void> {
