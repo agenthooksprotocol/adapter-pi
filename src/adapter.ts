@@ -151,7 +151,7 @@ export class Adapter {
         source: SOURCE,
         harness: { name: "pi", version: VERSION },
         capabilities: this.ctx.hasUI ? capabilities : withoutUI,
-        ...(this.logins ? { auth: this.logins.provider, fetch: this.logins.fetch } : {}),
+        ...(this.logins ? { auth: this.logins.provider } : {}),
         manifestMetadata: {
           authentication: ["bearer", "oauth"],
           contentCategories,
@@ -241,7 +241,8 @@ export class Adapter {
     // The adapter reads no attachment back: release what the SDK kept.
     void result.content?.close().catch(() => {});
     for (const diagnostic of result.diagnostics) {
-      this.logins?.observe(diagnostic.backendId, diagnostic.auth);
+      // Preparation fails at an upload endpoint; interception and observation at the event endpoint.
+      this.logins?.observe(diagnostic.backendId, diagnostic.auth, diagnostic.phase === "preparation" ? "upload" : "event");
       const line = `${diagnostic.backendId} ${diagnostic.phase}: ${diagnostic.code}${diagnostic.auth ? ` (${diagnostic.auth.code})` : ""}`;
       if (diagnostic.syntheticDenial) this.warn(`${line} (denied by failure policy)`);
       else this.log(line);

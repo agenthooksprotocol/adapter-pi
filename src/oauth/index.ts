@@ -113,9 +113,6 @@ interface Refusal {
  * configuration discovery reported. */
 type Source = "prepare" | "delivery";
 
-/** Bearer tokens remembered per delivery credential, at most. */
-const MAX_TOKENS = 64;
-
 function code(error: unknown): string {
   return error instanceof AuthError ? error.code : error instanceof Error && error.name === "TimeoutError" ? "timeout" : "provider_failed";
 }
@@ -128,19 +125,20 @@ export class Logins {
   readonly #backends = new Map<string, Backend>();
   /** Backends whose last delivery needs a login, with the scopes it needed. */
   readonly #needed = new Map<string, readonly string[] | undefined>();
-  /** The last authentication failure that a login will not fix. */
-  readonly #failing = new Map<string, string>();
+  /** The last authentication failure a delivery or configuration discovery
+   * reported that a login will not fix. */
+  readonly #deliveryFailures = new Map<string, string>();
+  /** The last failure of this pi's own prepare. */
+  readonly #prepareFailures = new Map<string, string>();
   readonly #active = new Map<string, Active>();
   readonly #ensuring = new Map<string, Promise<"ready" | Active | string>>();
   readonly #told = new Set<string>();
-  /** The last access_denied naming scopes a person can act on. Cleared only by
-   * evidence the backend now accepts its credential, or by a sign-out: a sign-in
-   * changes no allowed scope, and an unrelated access_denied says nothing of it. */
+  /** The last access_denied naming scopes a person can act on: a past
+   * observation. The allowed scopes are fixed for this instance, so it recurs
+   * whenever the backend asks again; only a sign-out (or a reload) clears it. */
   readonly #refusals = new Map<string, Refusal>();
   /** The last prepare's scoped access_denied, for its own failure's hint. */
   readonly #prepareRefusals = new Map<string, Refusal>();
-  /** Which backend each recent OAuth delivery token belongs to. */
-  readonly #tokens = new Map<string, string>();
 
   constructor(readonly host: LoginHost, agentDir: string, backends: readonly Record<string, unknown>[], options: LoginOptions = {}) {
     this.store = new FileTokenStore(join(agentDir, "ahp-auth.json"));
@@ -169,11 +167,7 @@ export class Logins {
       return provider;
     };
     const oauth: DeliveryAuthProvider = {
-      credential: async (context) => {
-        const credential = await route(context.backendId).credential(context);
-        if (credential) this.#remember(credential.token, context.backendId);
-        return credential;
-      },
+      credential: (context) => route(context.backendId).credential(context),
       challenge: (context) => route(context.backendId).challenge(context),
       // A sign-in lets Hooks retry a backend whose configuration discovery it skipped.
       onPrepared: (listener) => {
@@ -186,28 +180,6 @@ export class Logins {
       oauth,
       discover: oauth,
     });
-  }
-
-  #remember(token: string, backendId: string): void {
-    this.#tokens.delete(token);
-    this.#tokens.set(token, backendId);
-    if (this.#tokens.size > MAX_TOKENS) this.#tokens.delete(this.#tokens.keys().next().value!);
-  }
-
-  /** Hooks' fetch for deliveries and configuration discovery: a request carrying
-   * a backend's OAuth token that is not refused (401 or 403) is evidence the
-   * backend accepts it now, which ends what it last refused. */
-  readonly fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const response = await fetch(input, init);
-    const authorization = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined)).get("authorization");
-    const backendId = authorization?.startsWith("Bearer ") ? this.#tokens.get(authorization.slice(7)) : undefined;
-    if (backendId && response.status !== 401 && response.status !== 403) this.#accepted(backendId);
-    return response;
-  }) as typeof fetch;
-
-  #accepted(id: string): void {
-    this.#refusals.delete(id);
-    this.#failing.delete(id);
   }
 
   /** Local trust: the issuer, client and scopes this backend may use. */
@@ -261,9 +233,9 @@ export class Logins {
       // names none does not drop them.
       const scopes = [...new Set([...(this.#needed.get(backendId) ?? []), ...(failure.requiredScopes ?? [])])];
       this.#needed.set(backendId, scopes.length ? scopes : undefined);
-      this.#failing.delete(backendId);
+      this.#deliveryFailures.delete(backendId);
     } else {
-      this.#failing.set(backendId, failure.code);
+      this.#deliveryFailures.set(backendId, failure.code);
       // The SDK refuses a step-up beyond the ceiling itself, naming the scopes. One
       // naming none is something else, and leaves a recorded refusal as it was.
       if (failure.code === "access_denied" && failure.requiredScopes?.length) {
@@ -332,6 +304,7 @@ export class Logins {
     const endpoint = backend.endpoints[0];
     if (!endpoint) return "unsupported_binding";
     const requiredScopes = this.#needed.get(backend.id);
+    this.#prepareFailures.delete(backend.id);
     let receiver: Receiver | undefined;
     try {
       receiver = await receive((callback) => this.#complete(backend, callback));
@@ -361,7 +334,7 @@ export class Logins {
         if (refusal.outside.length || refusal.partial.length) this.#refusals.set(backend.id, refusal);
       }
       this.#needed.delete(backend.id);
-      this.#failing.set(backend.id, failure);
+      this.#prepareFailures.set(backend.id, failure);
       return failure;
     }
   }
@@ -457,7 +430,8 @@ export class Logins {
       this.#needed.delete(id);
       this.#told.delete(id);
     }
-    this.#failing.delete(id);
+    this.#deliveryFailures.delete(id);
+    this.#prepareFailures.delete(id);
     const active = this.#active.get(id);
     if (!active) return;
     this.#active.delete(id);
@@ -478,7 +452,7 @@ export class Logins {
   async #relevant(backend: BackendAuth): Promise<boolean> {
     const endpoint = backend.endpoints[0];
     if (!endpoint || backend.headerAuthorization || backend.preset?.type === "bearer") return false;
-    if (backend.preset?.type === "oauth" || backend.configured || this.#needed.has(backend.id) || this.#failing.has(backend.id)) return true;
+    if (backend.preset?.type === "oauth" || backend.configured || this.#needed.has(backend.id) || this.#deliveryFailures.has(backend.id) || this.#prepareFailures.has(backend.id)) return true;
     const binding = await this.store.load(bindingKey(NAMESPACE, this.#context(backend, endpoint)), AbortSignal.timeout(10_000)).catch(() => undefined);
     return binding !== undefined;
   }
@@ -510,7 +484,7 @@ export class Logins {
     if (backend.headerAuthorization) return "Authorization header from hooks.json";
     if (backend.preset?.type === "bearer") return "bearer token from hooks.json";
     if (!(await this.#relevant(backend))) return "no sign-in needed";
-    const failing = this.#failing.get(backend.id);
+    const delivery = this.#deliveryFailures.get(backend.id);
     const result = await this.#ensure(backend);
     const refusal = this.#refusal(backend.id);
     if (result === "ready") {
@@ -519,7 +493,8 @@ export class Logins {
     }
     if (typeof result === "string") {
       const own = `failing: ${result}${hint(result, this.#prepareRefusals.get(backend.id), "prepare")}`;
-      return failing ? `${own}; last delivery: ${failing}${hint(failing, refusal, "delivery")}` : own;
+      // A delivery failing the same way is this failure again, already explained.
+      return delivery && delivery !== result ? `${own}; last delivery: ${delivery}${hint(delivery, refusal, "delivery")}` : own;
     }
     return `needs-login: ${result.login.authorizationUrl}`;
   }
@@ -630,9 +605,10 @@ function hint(failure: string, refusal: Refusal | undefined, source: Source): st
     if (!parts.length) parts.push(`the issuer did not grant ${refusal.required.join(" ")}`);
     return ` (${parts.join("; ")})`;
   }
-  // A sign-in's own bare access_denied is local trust; a delivery's is a 403.
+  // A sign-in's own bare access_denied is local issuer trust. A delivery's may be
+  // that too, or a token endpoint's denial: no more is known.
   if (failure === "access_denied") {
-    return source === "prepare" ? " (the issuer is not trusted: set oauth.issuer, or oauth.trustAdvertisedIssuer for a browser sign-in, in hooks.json)" : " (the backend refused access)";
+    return source === "prepare" ? " (the issuer is not trusted: set oauth.issuer, or oauth.trustAdvertisedIssuer for a browser sign-in, in hooks.json)" : " (access was denied)";
   }
   if (failure === "untrusted_destination") return " (a private address: set oauth.allowPrivateNetwork in hooks.json)";
   return "";

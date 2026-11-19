@@ -20,9 +20,10 @@ const ID = "org.example.protected";
  * the scope the token endpoint grants. */
 function server() {
   const codes = new Set<string>();
-  const state = { granted: "hooks admin", registrations: 0 };
+  const state = { granted: "hooks admin", registrations: 0, down: false };
   const handle = async (request: Request): Promise<Response> => {
     const url = new URL(request.url);
+    if (state.down) return new Response("down", { status: 503 });
     if (url.pathname === "/.well-known/oauth-protected-resource/ahp") return Response.json({ resource: `${ISSUER}/ahp`, authorization_servers: [ISSUER] });
     if (url.pathname === "/.well-known/oauth-authorization-server") {
       return Response.json({
@@ -261,48 +262,43 @@ test("a refusal stays through an unrelated access_denied, until a sign-out", asy
   expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
 });
 
-/** A protected resource that answers `status` to whatever is sent. */
-function resource(status: number) {
-  const server = Bun.serve({ port: 0, hostname: "127.0.0.1", fetch: () => new Response(null, { status }) });
-  return { url: `http://127.0.0.1:${server.port}/ahp`, stop: () => server.stop(true) };
-}
-
-/** A delivery as Hooks makes it: the provider's credential, sent through the logins' fetch. */
-async function deliver(logins: Logins, url: string): Promise<number> {
-  const credential = await logins.provider.credential({ backendId: ID, purpose: "event", url: `${ISSUER}/ahp` });
-  expect(credential).toBeDefined();
-  const headers = new Headers({ authorization: `Bearer ${credential!.token}` });
-  return (await logins.fetch(url, { method: "POST", headers, body: "{}" })).status;
-}
-
-test("a delivery the backend accepts ends what it last refused; one it refuses does not", async () => {
-  const { as, host, logins } = setup(["hooks"]);
-  await signIn(as, host, logins);
-  logins.observe(ID, refused);
-  const forbidden = resource(403);
-  const accepted = resource(202);
-  try {
-    expect(await deliver(logins, forbidden.url)).toBe(403);
-    await logins.command(`status ${ID}`);
-    expect(host.notes.at(-1)).toContain(`${ID}: authorized; last refused`);
-    expect(await deliver(logins, accepted.url)).toBe(202);
-    await logins.command(`status ${ID}`);
-    expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
-  } finally {
-    forbidden.stop();
-    accepted.stop();
-  }
-});
-
-test("a delivery's own 403 is the backend refusing, not an untrusted issuer", async () => {
+test("a delivery's bare access_denied is not called an untrusted issuer, nor the sign-in's failure a delivery's", async () => {
   // No client for a sign-in: prepare fails credential_unavailable.
   const { host, logins } = setup(["hooks"], { oauth: { issuer: ISSUER, scopes: ["hooks"] } });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: failing: credential_unavailable (no client: set oauth.clientId, oauth.clientMetadataDocument, or oauth.issuer with oauth.registration in hooks.json)`);
   logins.observe(ID, { code: "access_denied", recovery: "none" });
   await logins.command(`status ${ID}`);
   const note = host.notes.at(-1)!;
   expect(note).toContain("failing: credential_unavailable (no client");
-  expect(note).toContain("last delivery: access_denied (the backend refused access)");
+  expect(note).toContain("; last delivery: access_denied (access was denied)");
   expect(note).not.toContain("not trusted");
+});
+
+test("a sign-in's earlier failure is not reported as a delivery's", async () => {
+  // No client for a sign-in, and the server down at first.
+  const { as, host, logins } = setup(["hooks"], { oauth: { issuer: ISSUER, scopes: ["hooks"] } });
+  as.state.down = true;
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toStartWith(`${ID}: failing: `);
+  expect(host.notes.at(-1)).not.toContain("credential_unavailable");
+  as.state.down = false;
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toStartWith(`${ID}: failing: credential_unavailable`);
+  expect(host.notes.at(-1)).not.toContain("last delivery");
+});
+
+test("an untrusted issuer is one failure, with the trust hint", async () => {
+  // No oauth.issuer and the advertised one not trusted.
+  const { host, logins } = setup(["hooks"], { oauth: { scopes: ["hooks"] } });
+  for (let i = 0; i < 2; i++) {
+    await logins.command(`status ${ID}`);
+    expect(host.notes.at(-1)).toBe(`${ID}: failing: access_denied (the issuer is not trusted: set oauth.issuer, or oauth.trustAdvertisedIssuer for a browser sign-in, in hooks.json)`);
+  }
+  // Deliveries fail the same way: still one failure.
+  logins.observe(ID, { code: "access_denied", recovery: "none" });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).not.toContain("last delivery");
 });
 
 test("a sign-in does not lift a refusal: a backend refused at startup stays reported", async () => {
@@ -478,4 +474,32 @@ test("an upload refused a scope its endpoint allows is the issuer granting fewer
   logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["uploads"] }, "upload");
   await logins.command(`status ${ID}`);
   expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+});
+
+test("a delivery's upload refusal is judged at the upload endpoint", async () => {
+  const config = {
+    oauth: {},
+    authentication: { type: "oauth", flow: "authorization_code_pkce", issuer: ISSUER, resource: `${ISSUER}/ahp`, clientId: "pi", scopes: ["hooks"] },
+    subscriptions: [{ mode: "observe", events: ["*"], content: { default: "body" }, upload: { endpoint: `${ISSUER}/content`, timeoutMs: 1000, maxBytes: 1000, auth: { type: "oauth", flow: "authorization_code_pkce", issuer: ISSUER, resource: `${ISSUER}/content`, clientId: "pi", scopes: ["upload"] } } }],
+  };
+  const { as, host, logins } = setup(undefined, config);
+  await signIn(as, host, logins);
+  // The upload endpoint is challenged for hooks, which only the event endpoint allows.
+  const response = new Response(null, { status: 403, headers: { "www-authenticate": 'Bearer error="insufficient_scope", scope="hooks"' } });
+  const error = (await Promise.resolve(logins.provider.challenge({ backendId: ID, purpose: "upload", url: `${ISSUER}/content`, authentication: config.subscriptions[0]!.upload.auth as never, response, credential: undefined })).then(
+    () => undefined,
+    (thrown: unknown) => thrown,
+  )) as AuthError;
+  expect(error.code).toBe("access_denied");
+  expect(error.requiredScopes).toEqual(["hooks"]);
+  // Hooks reports it as a preparation failure: the adapter names the upload endpoint.
+  const adapter = new Adapter({} as ExtensionAPI);
+  adapter.logins = logins;
+  adapter.report({
+    event: {}, effects: [], acceptedResponses: [], state: {}, interrupted: false,
+    diagnostics: [{ backendId: ID, subscriptionIndex: 0, phase: "preparation", code: "auth_failed" as never, syntheticDenial: false, auth: { code: error.code, recovery: error.recovery, requiredScopes: error.requiredScopes! } }],
+  });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain(`${ID}: authorized; last refused`);
+  expect(host.notes.at(-1)).toContain("not allowed on every endpoint: hooks");
 });
