@@ -27,6 +27,35 @@ test("each sign-in listens on a port of its own, for its own login's redirect on
   expect(seen).toHaveLength(1);
 });
 
+test("one callback per login: a repeat is answered neutrally, not as a failure", async () => {
+  let calls = 0;
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const receiver = await receive(async () => {
+    calls++;
+    await gate;
+    return { ok: true, message: "Signed in to a." };
+  });
+  receiver.state = "A";
+  const first = fetch(`${receiver.redirectUri}?code=c&state=A`);
+  await Bun.sleep(50);
+  // A second request while the first is handled, and another after it.
+  const during = await fetch(`${receiver.redirectUri}?code=c&state=A`);
+  release();
+  expect((await first).status).toBe(200);
+  const after = await fetch(`${receiver.redirectUri}?code=c&state=A`);
+  for (const repeat of [during, after]) {
+    expect(repeat.status).toBe(200);
+    expect(await repeat.text()).toContain("already received");
+  }
+  expect(calls).toBe(1);
+  // A handler that leaves the login waiting takes the next one.
+  receiver.state = "A";
+  expect((await fetch(`${receiver.redirectUri}?code=d&state=A`)).status).toBe(200);
+  expect(calls).toBe(2);
+  receiver.close();
+});
+
 test("settings: registration only for a named issuer, and no fixed redirect port", () => {
   const base = { id: "org.example.a", transport: { type: "http", url: "https://h.example/ahp" } };
   const unnamed = backendAuth({ ...base, oauth: { registration: true } });

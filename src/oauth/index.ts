@@ -18,7 +18,7 @@ import { auth, AuthError, type DeliveryAuthContext, type DeliveryAuthFailure, ty
 import { bindingKey, managedOAuth, type ClientConfig, type Operation, type PendingLogin, type StoredRecord } from "agenthooksprotocol/oauth";
 import { join } from "node:path";
 import { receive, type Receiver } from "./callback.js";
-import { networkPolicy } from "./network.js";
+import { networkPolicy, type NetworkPolicy } from "./network.js";
 import { backendAuth, trustedIssuer, type BackendAuth, type Endpoint } from "./settings.js";
 import { FileSecrets, FileTokenStore } from "./store.js";
 
@@ -56,10 +56,35 @@ interface Active {
   expiry?: ReturnType<typeof setTimeout>;
   /** `/ahp login` waiting for the login to end. */
   waiters: (() => void)[];
+  /** Set once the login has ended: nothing waits on it after that. */
+  ended?: boolean;
+}
+
+/** Where OAuth requests may go; tests substitute their own. */
+export interface LoginOptions {
+  network?: (allowPrivateNetwork: boolean) => NetworkPolicy;
 }
 
 function budget(ms: number, signal?: AbortSignal): Operation {
   return { signal: signal ?? new AbortController().signal, deadline: Date.now() + ms };
+}
+
+/** Whether `value` is an address on this redirect: the one a browser ends on. */
+function onRedirect(value: string, redirectUri: string): boolean {
+  try {
+    const actual = new URL(value), expected = new URL(redirectUri);
+    return actual.origin === expected.origin && actual.pathname === expected.pathname;
+  } catch {
+    return false;
+  }
+}
+
+function stateOf(callback: string): string | null {
+  try {
+    return new URL(callback).searchParams.get("state");
+  } catch {
+    return null;
+  }
 }
 
 function code(error: unknown): string {
@@ -79,14 +104,18 @@ export class Logins {
   readonly #active = new Map<string, Active>();
   readonly #ensuring = new Map<string, Promise<"ready" | Active | string>>();
   readonly #told = new Set<string>();
+  /** Scopes a login was refused for: outside what this backend may have. */
+  readonly #outside = new Map<string, readonly string[]>();
 
-  constructor(readonly host: LoginHost, agentDir: string, backends: readonly Record<string, unknown>[]) {
+  constructor(readonly host: LoginHost, agentDir: string, backends: readonly Record<string, unknown>[], options: LoginOptions = {}) {
     this.store = new FileTokenStore(join(agentDir, "ahp-auth.json"));
     this.secrets = new FileSecrets(join(agentDir, "ahp-secrets.json"));
+    // Earlier versions kept pending logins, PKCE verifiers included, in the store.
+    void this.store.dropExpiredLogins(AbortSignal.timeout(30_000)).catch(() => {});
     for (const raw of backends) {
       const { auth: backend, problems } = backendAuth(raw);
       this.problems.push(...problems);
-      const network = networkPolicy(backend.settings.allowPrivateNetwork);
+      const network = (options.network ?? networkPolicy)(backend.settings.allowPrivateNetwork);
       const oauth = managedOAuth({
         namespace: NAMESPACE,
         store: this.store,
@@ -166,7 +195,10 @@ export class Logins {
     if (!failure || !this.#backends.has(backendId)) return;
     if (failure.recovery === "login") {
       if (!this.#needed.has(backendId)) this.#told.delete(backendId);
-      this.#needed.set(backendId, failure.requiredScopes);
+      // Step-up scopes stay needed until a grant covers them: a later failure that
+      // names none does not drop them.
+      const scopes = [...new Set([...(this.#needed.get(backendId) ?? []), ...(failure.requiredScopes ?? [])])];
+      this.#needed.set(backendId, scopes.length ? scopes : undefined);
       this.#failing.delete(backendId);
     } else {
       this.#failing.set(backendId, failure.code);
@@ -196,7 +228,9 @@ export class Logins {
     const work = (async () => {
       const active = this.#active.get(backend.id);
       if (active) {
-        if (active.login.expiresAt > Date.now() && !(await this.#grantedElsewhere(active))) return active;
+        // A login prepared before a delivery asked for more scopes cannot grant them.
+        const covers = (this.#needed.get(backend.id) ?? []).every((scope) => active.required.includes(scope));
+        if (covers && active.login.expiresAt > Date.now() && !(await this.#grantedElsewhere(active)) && this.#active.get(backend.id) === active) return active;
         await this.#end(backend, active);
       }
       return this.#prepare(backend);
@@ -210,6 +244,7 @@ export class Logins {
     const endpoint = backend.endpoints[0];
     if (!endpoint) return "unsupported_binding";
     const requiredScopes = this.#needed.get(backend.id);
+    this.#outside.delete(backend.id);
     let receiver: Receiver | undefined;
     try {
       receiver = await receive((callback) => this.#complete(backend, callback));
@@ -231,6 +266,8 @@ export class Logins {
     } catch (error) {
       receiver?.close();
       const failure = code(error);
+      // Step-up scopes beyond the ceiling fail access_denied, naming them.
+      if (error instanceof AuthError && error.code === "access_denied" && error.requiredScopes?.length) this.#outside.set(backend.id, error.requiredScopes);
       this.#needed.delete(backend.id);
       this.#failing.set(backend.id, failure);
       return failure;
@@ -267,11 +304,36 @@ export class Logins {
       return { ok: true, message: `Signed in to ${backend.id}. You can close this tab.` };
     } catch (error) {
       const failure = code(error);
-      // A login that failed has ended; the next turn or /ahp login makes another.
       const active = this.#active.get(backend.id);
-      if (active && new URL(callback, "http://invalid").searchParams.get("state") === active.login.state) await this.#end(backend, active);
+      if (active && stateOf(callback) === active.login.state) {
+        // A callback the SDK refused before using it (a wrong address, issuer or a
+        // stray request) leaves the login waiting for the real one.
+        if (await this.#live(backend, active)) {
+          if (this.#active.get(backend.id) === active) active.receiver.state = active.login.state;
+          this.host.notify(`Sign-in to ${backend.id} failed: ${failure}. Its link still works.`, "warning");
+          return { ok: false, message: `This did not complete the sign-in to ${backend.id} (${failure}). The sign-in is still waiting in pi.` };
+        }
+        // A login the SDK used up has ended; the next turn or /ahp login makes another.
+        await this.#end(backend, active);
+      }
       this.host.notify(`Sign-in to ${backend.id} failed: ${failure}.`, "warning");
       return { ok: false, message: `Sign-in to ${backend.id} failed (${failure}). Run /ahp login ${backend.id} in pi to try again.` };
+    }
+  }
+
+  /** Whether the SDK still holds this login. It refuses a callback on another
+   * path before anything can consume the login, and fails interaction_required
+   * only for one that has ended (used, cancelled or expired). */
+  async #live(backend: Backend, active: Active): Promise<boolean> {
+    if (active.login.expiresAt <= Date.now()) return false;
+    const probe = new URL(active.receiver.redirectUri);
+    probe.pathname += "/probe";
+    probe.search = new URLSearchParams({ state: active.login.state }).toString();
+    try {
+      await backend.oauth.complete(probe.href, budget(10_000));
+      return false;
+    } catch (error) {
+      return code(error) !== "interaction_required";
     }
   }
 
@@ -285,6 +347,7 @@ export class Logins {
   }
 
   #stop(active: Active): void {
+    active.ended = true;
     clearTimeout(active.expiry);
     active.receiver.close();
     for (const settle of active.waiters.splice(0)) settle();
@@ -352,7 +415,7 @@ export class Logins {
       const flow = backend.settings.flow ?? backend.preset?.flow;
       return flow === "client_credentials" ? "client-credentials" : "authorized";
     }
-    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result)}`;
+    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result, this.#outside.get(backend.id))}`;
     return `needs-login: ${result.login.authorizationUrl}`;
   }
 
@@ -371,7 +434,7 @@ export class Logins {
         continue;
       }
       if (typeof result === "string") {
-        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result)}`, "warning");
+        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result, this.#outside.get(backend.id))}`, "warning");
         continue;
       }
       walked++;
@@ -382,21 +445,36 @@ export class Logins {
 
   /** Open the browser and wait for the redirect, or for a pasted one. */
   async #signIn(backend: Backend, active: Active): Promise<void> {
+    // Ended since it was prepared: there is nothing to wait for.
+    if (active.ended) return;
     this.host.open(active.login.authorizationUrl);
-    const stop = new AbortController();
-    const ended = new Promise<{ type: "ended" }>((resolve) => active.waiters.push(() => resolve({ type: "ended" })));
-    const contenders: Promise<{ type: "ended" } | { type: "pasted"; value: string | undefined }>[] = [ended];
-    if (this.host.hasUI) {
-      contenders.push(this.host.input(`Sign in to ${backend.id}`, "If the browser cannot reach pi, paste the address it ended on", stop.signal).then((value) => ({ type: "pasted" as const, value })));
-    }
+    const ended = new Promise<{ type: "ended" }>((resolve) => {
+      if (active.ended) resolve({ type: "ended" });
+      else active.waiters.push(() => resolve({ type: "ended" }));
+    });
     // The listener never keeps pi alive by itself: while a person is asked to sign
     // in (`pi -p "/ahp login …"` too), this does, until the login ends.
     const hold = setTimeout(() => {}, Math.max(0, active.login.expiresAt - Date.now()));
     try {
-      const first = await Promise.race(contenders);
-      stop.abort();
-      // The paste completes here, in the pi that owns the login.
-      if (first.type === "pasted" && first.value?.trim()) await this.#complete(backend, first.value.trim());
+      for (;;) {
+        const stop = new AbortController();
+        const contenders: Promise<{ type: "ended" } | { type: "pasted"; value: string | undefined }>[] = [ended];
+        if (this.host.hasUI) {
+          contenders.push(this.host.input(`Sign in to ${backend.id}`, "If the browser cannot reach pi, paste the address it ended on", stop.signal).then((value) => ({ type: "pasted" as const, value })));
+        }
+        const first = await Promise.race(contenders);
+        stop.abort();
+        const value = first.type === "pasted" ? first.value?.trim() : undefined;
+        if (!value) return;
+        // Not the redirect (the sign-in link itself, say): the login stays as it was.
+        if (!onRedirect(value, active.receiver.redirectUri)) {
+          this.host.notify(`That is not where the browser ended. Paste the address that starts with ${active.receiver.redirectUri}.`, "warning");
+          continue;
+        }
+        // The paste completes here, in the pi that owns the login.
+        const result = await this.#complete(backend, value);
+        if (result.ok || active.ended) return;
+      }
     } finally {
       clearTimeout(hold);
     }
@@ -426,8 +504,9 @@ export class Logins {
   }
 }
 
-function hint(failure: string): string {
+function hint(failure: string, outside?: readonly string[]): string {
   if (failure === "credential_unavailable") return " (no client: set oauth.clientId, oauth.clientMetadataDocument, or oauth.issuer with oauth.registration in hooks.json)";
+  if (failure === "access_denied" && outside?.length) return ` (it needs scopes this backend is not allowed: ${outside.join(" ")}; add them to oauth.scopes in hooks.json to allow them)`;
   if (failure === "access_denied") return " (the issuer is not trusted: set oauth.issuer, or oauth.trustAdvertisedIssuer for a browser sign-in, in hooks.json)";
   if (failure === "untrusted_destination") return " (a private address: set oauth.allowPrivateNetwork in hooks.json)";
   return "";

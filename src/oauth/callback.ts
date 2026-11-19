@@ -12,7 +12,9 @@ export type CallbackHandler = (callback: string) => Promise<{ ok: boolean; messa
 
 export interface Receiver {
   readonly redirectUri: string;
-  /** The login's `state`, once known: other callbacks are refused. */
+  /** The login's `state`, once known: other callbacks are refused. Cleared when
+   * a callback for it is accepted, so only one is handled; the handler sets it
+   * again if the login is still waiting. */
   state: string | undefined;
   close(): void;
 }
@@ -27,16 +29,25 @@ export async function receive(handler: CallbackHandler): Promise<Receiver> {
   let receiver: Receiver;
   let answering = 0;
   let closed = false;
+  /** States already handled here: a repeat gets a neutral page, not a failure. */
+  const handled = new Set<string>();
   const server = createServer((request, response) => {
     answering++;
     void (async () => {
       const url = new URL(request.url ?? "/", receiver.redirectUri);
       let answer = page(404, "Not found.");
       if (request.method === "GET" && url.pathname === CALLBACK_PATH && url.searchParams.has("state")) {
+        const state = url.searchParams.get("state")!;
         answer = page(400, "This sign-in is not one this pi is waiting for. Start it again with /ahp login.");
-        if (receiver.state !== undefined && url.searchParams.get("state") === receiver.state) {
+        if (receiver.state !== undefined && state === receiver.state) {
+          // One callback per login: a browser's repeat (a reload, a double redirect)
+          // must not report a failure beside the sign-in.
+          receiver.state = undefined;
+          handled.add(state);
           const result = await handler(url.href).catch(() => ({ ok: false, message: "Sign-in failed." }));
           answer = page(result.ok ? 200 : 400, result.message);
+        } else if (handled.has(state)) {
+          answer = page(200, "This sign-in was already received. You can close this tab.");
         }
       }
       response.writeHead(answer.status, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" });

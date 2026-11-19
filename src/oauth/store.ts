@@ -3,7 +3,7 @@
 // secrets in another. pi runs a process per terminal, RPC client and print run, so
 // a token refreshed in one must be the token the others read: refreshes are
 // serialised across processes by `coordinate`. Pending logins stay in the process
-// that started them.
+// that started them; expired ones earlier versions stored here are dropped.
 //
 // Locks are directories: one for each file's read-modify-write, and one per key
 // for `coordinate`. A lock is taken by renaming a prepared directory, its owner
@@ -236,6 +236,31 @@ export class FileTokenStore implements TokenStore {
 
   coordinate<T>(key: string, signal: AbortSignal, work: () => Promise<T>): Promise<T> {
     return withLock(join(this.#locks, createHash("sha256").update(key).digest("hex")), signal, work);
+  }
+
+  /** Delete the expired pending logins (and their PKCE verifiers) that versions
+   * which kept logins here left behind; once none is left, their indexes too. A
+   * live one may still belong to such a version's running pi, so it stays. */
+  async dropExpiredLogins(signal: AbortSignal): Promise<void> {
+    const stale = (records: Record<string, StoredRecord>) => {
+      const now = Date.now();
+      const expired = Object.keys(records).filter((key) => {
+        const record = records[key]!;
+        return record.kind === "pending_login" && !(record.expiresAt > now);
+      });
+      const live = Object.values(records).some((record) => record.kind === "pending_login" && record.expiresAt > now);
+      const indexes = live ? [] : Object.keys(records).filter((key) => records[key]!.kind === "pending_index");
+      return [...expired, ...indexes];
+    };
+    if (!stale((await this.#file.read()).records ?? {}).length) return;
+    await withLock(`${this.path}.lock`, signal, async () => {
+      const file = await this.#file.read(true);
+      const keys = stale(file.records ?? {});
+      if (!keys.length) return;
+      signal.throwIfAborted();
+      for (const key of keys) delete file.records[key];
+      await this.#file.write(file);
+    });
   }
 }
 
