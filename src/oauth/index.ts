@@ -87,6 +87,17 @@ function stateOf(callback: string): string | null {
   }
 }
 
+/** The scopes an endpoint's oauth binding names. */
+function bindingScopes(binding: Record<string, unknown> | undefined): string[] {
+  return binding?.type === "oauth" && Array.isArray(binding.scopes) ? (binding.scopes as string[]) : [];
+}
+
+/** The scopes a backend may have, as `#select` gives them: oauth.scopes, else each
+ * endpoint's binding's. A failure does not name its endpoint, so all of them. */
+function ceiling(backend: BackendAuth): string[] {
+  return backend.settings.scopes ?? [...new Set(backend.endpoints.flatMap((endpoint) => bindingScopes(endpoint.authentication)))];
+}
+
 function code(error: unknown): string {
   return error instanceof AuthError ? error.code : error instanceof Error && error.name === "TimeoutError" ? "timeout" : "provider_failed";
 }
@@ -170,7 +181,7 @@ export class Logins {
       clientSecret = await this.secrets.get(secretRef, operation.signal);
       if (clientSecret === undefined) throw new AuthError("credential_unavailable");
     }
-    const scopes = settings.scopes ?? (Array.isArray(preset?.scopes) ? (preset.scopes as string[]) : []);
+    const scopes = settings.scopes ?? bindingScopes(preset);
     return {
       issuer,
       resource,
@@ -202,18 +213,17 @@ export class Logins {
       this.#failing.delete(backendId);
     } else {
       this.#failing.set(backendId, failure.code);
-      // The SDK refuses a step-up beyond the ceiling itself, naming the scopes.
-      if (failure.code === "access_denied" && failure.requiredScopes?.length) this.#refused(backendId, failure.requiredScopes);
+      // The SDK refuses a step-up beyond the ceiling itself, naming the scopes; an
+      // access_denied naming none is something else.
+      if (failure.code === "access_denied") this.#refused(backendId, failure.requiredScopes ?? []);
     }
   }
 
   /** Scopes the backend may not have: required ones outside its configured scopes.
    * Fewer granted than asked for is the issuer's choice, not this. */
   #refused(id: string, required: readonly string[]): void {
-    const backend = this.#backends.get(id)!;
-    const preset = backend.preset?.type === "oauth" ? (backend.preset as Record<string, unknown>) : undefined;
-    const ceiling = backend.settings.scopes ?? (Array.isArray(preset?.scopes) ? (preset.scopes as string[]) : []);
-    const outside = required.filter((scope) => !ceiling.includes(scope));
+    const allowed = ceiling(this.#backends.get(id)!);
+    const outside = required.filter((scope) => !allowed.includes(scope));
     if (outside.length) this.#outside.set(id, outside);
     else this.#outside.delete(id);
   }
@@ -378,6 +388,8 @@ export class Logins {
       this.#told.delete(id);
     }
     this.#failing.delete(id);
+    // A grant completed or found ready: an earlier refusal is old news.
+    this.#outside.delete(id);
     const active = this.#active.get(id);
     if (!active) return;
     this.#active.delete(id);
@@ -431,29 +443,33 @@ export class Logins {
     if (backend.preset?.type === "bearer") return "bearer token from hooks.json";
     if (!(await this.#relevant(backend))) return "no sign-in needed";
     const failing = this.#failing.get(backend.id);
-    const result = await this.#ensure(backend);
+    // Read first: a grant found ready clears it.
     const outside = this.#outside.get(backend.id);
+    const result = await this.#ensure(backend);
     if (result === "ready") {
       const flow = backend.settings.flow ?? backend.preset?.flow;
       return `${flow === "client_credentials" ? "client-credentials" : "authorized"}${outside ? `, but refused${hint("access_denied", outside)}` : ""}`;
     }
-    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result, outside)}`;
+    if (typeof result === "string") return `failing: ${failing ?? result}${hint(result, this.#outside.get(backend.id))}`;
     return `needs-login: ${result.login.authorizationUrl}`;
   }
 
   async #login(target: string | undefined): Promise<void> {
     const backends = target ? [this.#backends.get(target)!] : [...this.#backends.values()];
     let walked = 0;
+    /** Backends that were reported on: a closing "nothing needed" would contradict. */
+    let reported = 0;
     for (const backend of backends) {
       if (!target && !(await this.#relevant(backend))) continue;
       if (!backend.endpoints.length) {
         this.host.notify(`${backend.id} is a local process: it has no sign-in.`, "warning");
         continue;
       }
-      const result = await this.#ensure(backend);
       const outside = this.#outside.get(backend.id);
+      const result = await this.#ensure(backend);
       if (result === "ready" && outside) {
         this.host.notify(`${backend.id} is signed in, but a sign-in cannot fix what it was refused${hint("access_denied", outside)}`, "warning");
+        reported++;
         continue;
       }
       if (result === "ready") {
@@ -461,13 +477,14 @@ export class Logins {
         continue;
       }
       if (typeof result === "string") {
-        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result, outside)}`, "warning");
+        this.host.notify(`${backend.id} cannot sign in: ${result}${hint(result, this.#outside.get(backend.id))}`, "warning");
+        reported++;
         continue;
       }
       walked++;
       await this.#signIn(backend, result);
     }
-    if (!target && walked === 0) this.host.notify("No backend needs a sign-in.");
+    if (!target && walked === 0 && reported === 0) this.host.notify("No backend needs a sign-in.");
   }
 
   /** Open the browser and wait for the redirect, or for a pasted one. */

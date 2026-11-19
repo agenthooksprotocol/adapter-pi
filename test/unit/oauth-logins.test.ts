@@ -4,6 +4,7 @@ import { afterAll, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AuthError } from "agenthooksprotocol/client";
 import { Logins, type LoginHost } from "../../src/oauth/index.ts";
 
 const root = mkdtempSync(join(tmpdir(), "ahp-pi-logins-"));
@@ -99,14 +100,15 @@ async function until(check: () => unknown, what: string): Promise<void> {
   }
 }
 
-function setup(scopes = ["hooks", "admin"]) {
+function setup(scopes: string[] | undefined = ["hooks", "admin"], extra: Record<string, unknown> = {}) {
   const as = server();
   const host = new Host();
   const backend = {
     id: ID,
     transport: { type: "http", url: `${ISSUER}/ahp` },
-    oauth: { issuer: ISSUER, registration: true, scopes },
+    oauth: { issuer: ISSUER, registration: true, ...(scopes ? { scopes } : {}) },
     subscriptions: [{ mode: "observe", events: ["*"], content: { default: "body" } }],
+    ...extra,
   };
   const logins = new Logins(host, mkdtempSync(join(root, "agent-")), [backend], { network: as.network });
   return { as, host, logins };
@@ -230,10 +232,78 @@ test("a step-up the SDK refuses beyond the allowed scopes says so, even when sig
   expect(host.notes.at(-1)).toContain(`${ID}: authorized, but refused`);
   // Only the scope outside oauth.scopes is named.
   expect(host.notes.at(-1)).toContain("not allowed: root;");
+  // The status found the grant ready, which clears it; the next refusal sets it again.
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["root"] });
   await logins.command(`login ${ID}`);
   expect(host.notes.at(-1)).toContain("not allowed: root;");
   expect(host.notes.at(-1)).not.toContain("already signed in");
   expect(host.notes.at(-1)).not.toContain("not trusted");
+});
+
+const refused = { code: "access_denied", recovery: "none", requiredScopes: ["root"] } as const;
+
+test("a refusal is forgotten once a grant is found ready, or an access_denied names no scopes", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  await signIn(as, host, logins);
+  logins.observe(ID, refused);
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain("not allowed: root;");
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+  logins.observe(ID, refused);
+  logins.observe(ID, { code: "access_denied", recovery: "none" });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+});
+
+test("a completed sign-in forgets a refusal", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  logins.observe(ID, refused);
+  await signIn(as, host, logins);
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toBe(`${ID}: authorized`);
+});
+
+test("the allowed scopes are every endpoint's when oauth.scopes is not set", async () => {
+  // A pre-registered client, named by each endpoint's binding.
+  const { as, host, logins } = setup(undefined, {
+    oauth: {},
+    authentication: { type: "oauth", flow: "authorization_code_pkce", issuer: ISSUER, resource: `${ISSUER}/ahp`, clientId: "pi", scopes: ["hooks"] },
+    subscriptions: [{ mode: "observe", events: ["*"], content: { default: "body" }, upload: { endpoint: `${ISSUER}/content`, timeoutMs: 1000, maxBytes: 1000, auth: { type: "oauth", flow: "authorization_code_pkce", issuer: ISSUER, resource: `${ISSUER}/content`, clientId: "pi", scopes: ["uploads"] } } }],
+  });
+  await signIn(as, host, logins);
+  logins.observe(ID, { code: "access_denied", recovery: "none", requiredScopes: ["uploads", "root"] });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain("not allowed: root;");
+});
+
+test("bare /ahp login reports a refusal without adding that nothing needs a sign-in", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  await signIn(as, host, logins);
+  logins.observe(ID, refused);
+  const before = host.notes.length;
+  await logins.command("login");
+  const said = host.notes.slice(before);
+  expect(said).toHaveLength(1);
+  expect(said[0]).toContain("not allowed: root;");
+});
+
+// SDK 0.15.0 gap: discovery refuses a step-up beyond the ceiling with a bare
+// access_denied, without requiredScopes, so the scopes never reach observe. This
+// asserts once the SDK attaches them.
+test.todo("the SDK's own refusal of a step-up beyond the ceiling names the scopes", async () => {
+  const { as, host, logins } = setup(["hooks"]);
+  await signIn(as, host, logins);
+  const response = new Response(null, { status: 403, headers: { "www-authenticate": 'Bearer error="insufficient_scope", scope="root"' } });
+  const error = await Promise.resolve(logins.provider.challenge({ backendId: ID, purpose: "event", url: `${ISSUER}/ahp`, response, credential: undefined })).then(
+    () => undefined,
+    (thrown: unknown) => thrown,
+  );
+  expect(error).toBeInstanceOf(AuthError);
+  const { code, recovery, requiredScopes } = error as AuthError;
+  logins.observe(ID, { code, recovery, ...(requiredScopes ? { requiredScopes } : {}) });
+  await logins.command(`status ${ID}`);
+  expect(host.notes.at(-1)).toContain("not allowed: root;");
 });
 
 test("a refusal naming only allowed scopes names none", async () => {
